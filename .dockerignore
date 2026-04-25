@@ -2,6 +2,10 @@
 .git
 .gitignore
 .venv
+venv/
+.benchmarks/
+.playwright-mcp/
+.github/
 __pycache__/
 *.py[cod]
 *.pyo
