@@ -26,3 +26,5 @@ screenshot.png
 .env
 *.env
 agent.md
+docs/
+CHANGELOG.md
