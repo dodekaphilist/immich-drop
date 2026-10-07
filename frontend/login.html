@@ -48,6 +48,9 @@
           <a id="backToUploader" href="/" class="btn hidden">Back to uploader</a>
         </div>
       </form>
+      <div class="mt-4">
+        <a href="/oauth/start" class="btn" style="display:block;text-align:center;">Login with SSO (OAuth)</a>
+      </div>
     </div>
 
     <footer class="site-footer">
@@ -63,6 +66,7 @@
       msg.textContent = text;
       msg.className = 'banner mb-3 ' + (kind==='ok' ? 'banner--ok' : 'banner--err');
     }
+    if (new URLSearchParams(location.search).get('error') === 'oauth_failed') show('err', 'SSO login failed');
     form.onsubmit = async (e)=>{
       e.preventDefault();
       const email = document.getElementById('email').value.trim();

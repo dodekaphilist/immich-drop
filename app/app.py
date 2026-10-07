@@ -11,12 +11,14 @@ Immich Drop Uploader – Backend (FastAPI, simplified)
 from __future__ import annotations
 
 import asyncio
+import base64
 import binascii
 import io
 import json
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import time
 from contextlib import asynccontextmanager, suppress
@@ -1154,6 +1156,69 @@ async def api_login(request: Request) -> JSONResponse:
     })
     logger.info("User %s logged in", data.get("userEmail"))
     return JSONResponse({"ok": True, **{k: data.get(k) for k in ("userEmail","userId","name","isAdmin")}})
+
+def _oauth_redirect_uri(request: Request) -> str:
+    base = (SETTINGS.public_base_url or str(request.base_url)).rstrip("/")
+    return f"{base}/oauth/callback"
+
+@app.get("/oauth/start")
+async def oauth_start(request: Request) -> RedirectResponse:
+    """Begin Immich OAuth/OIDC login (PKCE); redirects the browser to the identity provider."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(32)
+    try:
+        # Throwaway client: httpx keeps response cookies on the client that made the request.
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                f"{SETTINGS.normalized_base_url}/oauth/authorize",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                json={"redirectUri": _oauth_redirect_uri(request), "state": state, "codeChallenge": challenge},
+            )
+    except Exception as e:
+        logger.exception("OAuth authorize request failed: %s", e)
+        return RedirectResponse(url="/login?error=oauth_failed")
+    url = r.json().get("url") if r.status_code in (200, 201) and r.content else None
+    if not url:
+        logger.warning("OAuth authorize rejected: %s - %s", r.status_code, r.text)
+        return RedirectResponse(url="/login?error=oauth_failed")
+    request.session["oauth"] = {"state": state, "verifier": verifier}
+    return RedirectResponse(url=url)
+
+@app.get("/oauth/callback")
+async def oauth_callback(request: Request) -> RedirectResponse:
+    """Finish Immich OAuth login: exchange the callback URL for an Immich access token."""
+    pending = request.session.pop("oauth", None)
+    received_state = request.query_params.get("state")
+    if not pending or not received_state or not secrets.compare_digest(received_state, pending["state"]):
+        logger.warning("OAuth callback with missing or mismatched state")
+        return RedirectResponse(url="/login?error=oauth_failed")
+    # Behind a proxy the request scheme/host may differ; rebuild from the registered redirect URI.
+    callback_url = f"{_oauth_redirect_uri(request)}?{request.url.query}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                f"{SETTINGS.normalized_base_url}/oauth/callback",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                json={"url": callback_url, "state": pending["state"], "codeVerifier": pending["verifier"]},
+            )
+    except Exception as e:
+        logger.exception("OAuth callback request failed: %s", e)
+        return RedirectResponse(url="/login?error=oauth_failed")
+    data = r.json() if r.content else {}
+    token = data.get("accessToken") if r.status_code in (200, 201) else None
+    if not token:
+        logger.warning("OAuth login rejected: %s - %s", r.status_code, r.text)
+        return RedirectResponse(url="/login?error=oauth_failed")
+    request.session.update({
+        "accessToken": token,
+        "userEmail": data.get("userEmail"),
+        "userId": data.get("userId"),
+        "name": data.get("name"),
+        "isAdmin": data.get("isAdmin", False),
+    })
+    logger.info("User %s logged in via OAuth", data.get("userEmail"))
+    return RedirectResponse(url="/menu")
 
 @app.post("/api/logout")
 async def api_logout(request: Request) -> dict:
