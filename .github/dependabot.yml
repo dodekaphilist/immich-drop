@@ -33,6 +33,12 @@ updates:
     directory: "/web"
     schedule:
       interval: weekly
+    # @immich/ui depends on @sveltejs/kit 2.x; stay on kit 2 and adapter-static 3
+    ignore:
+      - dependency-name: "@sveltejs/kit"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@sveltejs/adapter-static"
+        update-types: ["version-update:semver-major"]
     groups:
       web-deps:
         patterns:
