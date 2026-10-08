@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-08
+
 ### Added
 - Platform cookies are saved per user; cookies saved before have no owner and are no longer used.
 - Every user saves an Immich API key of their own (asked right after the first login, changeable in the settings; a red dot on the cog shows a missing or rejected key): guest uploads through their links and their platform downloads go to their own account. The key needs `user.read` so the app can check that it belongs to the logged-in account. `IMMICH_API_KEY` is optional now; when set, it is used for everyone, saved keys are ignored and the field is locked. The local duplicate cache is kept per account. The settings link to Immich's API key page when `IMMICH_BASE_URL` is a public address.
@@ -11,6 +13,10 @@ All notable changes to this project will be documented in this file.
 - New UI built with Svelte and `@immich/ui`: `/login`, `/` (upload, files or URLs,
   optional target album) and
   `/invite/<token>` (guests). The old static pages are gone.
+- The iOS Shortcut and its endpoints are back as an optional feature: `SHORTCUT_ENABLED=true` turns it on, and every user generates their own token in the settings (sent as `Authorization: Bearer <token>`; only a hash is stored). The shortcut then works with the user's own API key and cookies.
+- One shared album choice (existing album or a new name; the configured default is preselected) for both "Download from service" and "Create upload link". An empty `album_name` on `/api/upload/url` and the shortcut endpoints now means "no album"; omitting it still uses `IMMICH_ALBUM_NAME`.
+- The app can run under a subfolder such as `https://immich.example.com/drop`: put it into `PUBLIC_BASE_URL`; the path is taken from there. The same build works at the root and under a subfolder, and with proxies that keep or strip the prefix. The session cookie is scoped to the subfolder.
+- The name of a link can be set in the "New link" dialog; the default is now readable (album or "Link" plus date).
 
 ### Security
 - Upload endpoints (`/api/upload`, chunk endpoints) now require an invite
@@ -27,16 +33,6 @@ All notable changes to this project will be documented in this file.
 - Link creation is a section of the upload page (below the drop area); `/links` only manages links.
 - The connection check on the login page is a coloured dot with a tooltip.
 - The software/version line is gone from the pages.
-
-### Added (continued)
-- The iOS Shortcut and its endpoints are back as an optional feature: `SHORTCUT_ENABLED=true` turns it on, and every user generates their own token in the settings (sent as `Authorization: Bearer <token>`; only a hash is stored). The shortcut then works with the user's own API key and cookies.
-- One shared album choice (existing album or a new name; the configured default is preselected) for both "Download from service" and "Create upload link". An empty `album_name` on `/api/upload/url` and the shortcut endpoints now means "no album"; omitting it still uses `IMMICH_ALBUM_NAME`.
-
-### Added (continued)
-- The app can run under a subfolder such as `https://immich.example.com/drop`: put it into `PUBLIC_BASE_URL`; the path is taken from there. The same build works at the root and under a subfolder, and with proxies that keep or strip the prefix. The session cookie is scoped to the subfolder.
-- The name of a link can be set in the "New link" dialog; the default is now readable (album or "Link" plus date).
-
-### Changed (continued)
 - `IMMICH_BASE_URL` and `PUBLIC_BASE_URL` are required: the app refuses to start (exit code 1, the missing setting is named in the log) if one is missing or not an http(s) URL. `IMMICH_BASE_URL` no longer defaults to localhost, and `/api` is added to it when missing.
 - `DATA_DIR` (default `/data`) replaces `STATE_DB` and `CHUNK_DIR`; state, chunks and cookies all live in it. Set it only for runs outside Docker.
 - The container no longer starts Uvicorn with auto-reload; set `RELOAD=true` for development. A missing `SESSION_SECRET` is logged as a warning.
@@ -48,6 +44,9 @@ All notable changes to this project will be documented in this file.
 - (Re-added as optional, see above:) iOS Shortcut docs and `/api/upload/base64`, `/api/upload/file`,
   `/api/upload/batch`, `/api/upload/urls`.
 - The "Test connection" button; the connection is checked on the login page.
+
+### Dependencies
+- Python packages, `gallery-dl` and the Node build image (26) updated. `@sveltejs/kit` and `@sveltejs/adapter-static` stay on 2.x/3.x because `@immich/ui` requires SvelteKit 2.
 
 ## [1.9.1] - 2026-08-25
 
