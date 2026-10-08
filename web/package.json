@@ -1,0 +1,24 @@
+{
+  "name": "immich-drop-login",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "@immich/ui": "^0.90.0",
+    "@mdi/js": "^7.4.47",
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.3",
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "svelte": "^5.57.2",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.3"
+  },
+  "dependencies": {
+    "@fontsource-variable/google-sans": "^5.3.1",
+    "@fontsource-variable/google-sans-code": "^5.3.1"
+  }
+}

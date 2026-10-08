@@ -1,0 +1,22 @@
+@import '@immich/ui/theme/default.css';
+@source '../node_modules/@immich/ui/dist';
+@import '@fontsource-variable/google-sans';
+@import '@fontsource-variable/google-sans-code';
+
+@theme {
+  --font-sans: 'Google Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Google Sans Code Variable', ui-monospace, monospace;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-light-50);
+  color: var(--color-dark);
+}
+
+/* Tooltips wrap instead of running out of the viewport */
+.tooltip-content {
+  max-width: calc(100vw - 2rem);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
