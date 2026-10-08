@@ -1,10 +1,12 @@
-"""Build the Dead-Drop iOS Shortcut as a signed .shortcut file."""
+"""Build the Immich Drop iOS Shortcut as a signed .shortcut file."""
 import plistlib
 import subprocess
 import sys
 import os
 
 SERVER = "https://YOUR-SERVER-HERE.example.com"
+# The token generated in the app's settings (see docs/ios-shortcuts.md)
+TOKEN = "YOUR-SHORTCUT-TOKEN"
 
 # Group UUIDs for control flow blocks
 GID_IF_URL = "B0000001-0000-0000-0000-000000000001"
@@ -80,6 +82,15 @@ def var_as_input(name):
     }
 
 
+def auth_headers():
+    """HTTP headers for Get Contents of URL: Authorization: Bearer <token>."""
+    return {"Value": {"WFDictionaryFieldValueItems": [
+        {"WFItemType": 0,
+         "WFKey": {"Value": {"string": "Authorization"}, "WFSerializationType": "WFTextTokenString"},
+         "WFValue": {"Value": {"string": f"Bearer {TOKEN}"}, "WFSerializationType": "WFTextTokenString"}},
+    ]}, "WFSerializationType": "WFDictionaryFieldValue"}
+
+
 def act(identifier, params=None):
     """Build a shortcut action dict."""
     return {
@@ -119,6 +130,7 @@ actions.append(act("is.workflow.actions.conditional", {
 actions.append(act("is.workflow.actions.downloadurl", {
     "WFURL": f"{SERVER}/api/upload/url",
     "WFHTTPMethod": "POST",
+    "WFHTTPHeaders": auth_headers(),
     "WFHTTPBodyType": "JSON",
     "WFJSONValues": {"Value": {"WFDictionaryFieldValueItems": [
         {"WFItemType": 0,
@@ -168,6 +180,7 @@ actions.append(act("is.workflow.actions.gettext", {
 }))
 actions.append(act("is.workflow.actions.downloadurl", {
     "WFHTTPMethod": "GET",
+    "WFHTTPHeaders": auth_headers(),
 }))
 actions.append(act("is.workflow.actions.setvariable", {"WFVariableName": "pollRaw"}))
 
@@ -196,7 +209,7 @@ actions.append(act("is.workflow.actions.gettext", {
 }))
 actions.append(act("is.workflow.actions.setvariable", {"WFVariableName": "isDone"}))
 actions.append(act("is.workflow.actions.alert", {
-    "WFAlertActionTitle": "Dead-Drop",
+    "WFAlertActionTitle": "Immich Drop",
     "WFAlertActionMessage": "Upload complete",
 }))
 actions.append(act("is.workflow.actions.exit", {}))
@@ -224,7 +237,7 @@ actions.append(act("is.workflow.actions.gettext", {
 }))
 actions.append(act("is.workflow.actions.setvariable", {"WFVariableName": "isDone"}))
 actions.append(act("is.workflow.actions.alert", {
-    "WFAlertActionTitle": "Dead-Drop",
+    "WFAlertActionTitle": "Immich Drop",
     "WFAlertActionMessage": "Upload failed",
 }))
 actions.append(act("is.workflow.actions.exit", {}))
@@ -288,8 +301,8 @@ shortcut = {
     "WFWorkflowActions": actions,
 }
 
-unsigned = "/tmp/dead-drop-unsigned.shortcut"
-signed = os.path.expanduser("~/Downloads/Dead-Drop.shortcut")
+unsigned = "/tmp/immich-drop-unsigned.shortcut"
+signed = os.path.expanduser("~/Downloads/Immich-Drop.shortcut")
 
 with open(unsigned, "wb") as f:
     plistlib.dump(shortcut, f, fmt=plistlib.FMT_BINARY)
