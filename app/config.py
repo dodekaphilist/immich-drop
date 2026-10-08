@@ -4,10 +4,16 @@ Reads ONLY from .env; there is NO runtime mutation from the UI.
 """
 
 from __future__ import annotations
+import ipaddress
 import os
+from urllib.parse import urlparse
 from dataclasses import dataclass
 import secrets
 from dotenv import load_dotenv
+
+
+class ConfigError(Exception):
+    """The configuration is incomplete or invalid; the app must not start."""
 
 
 @dataclass
@@ -16,10 +22,11 @@ class Settings:
     immich_base_url: str
     immich_api_key: str
     album_name: str = ""
-    public_upload_page_enabled: bool = False
     public_base_url: str = ""
-    state_db: str = ""
+    base_path: str = ""
+    data_dir: str = "/data"
     session_secret: str = ""
+    session_secret_generated: bool = False
     log_level: str = "INFO"
     chunked_uploads_enabled: bool = False
     chunk_size_mb: int = 95
@@ -31,11 +38,35 @@ class Settings:
     social_media_uploads: bool = True
     test_connection_enabled: bool = True
     test_connection_show_hostname: bool = True
+    shortcut_enabled: bool = False
+
+    @property
+    def immich_web_url(self) -> str:
+        """Address of the Immich web UI for links in the UI; empty if IMMICH_BASE_URL looks internal.
+
+        Internal means localhost, an IP address, or a name without a dot (e.g. the Docker service "immich_server"):
+        users could not open those from their browser.
+        """
+        url = self.immich_base_url.strip().rstrip("/")
+        url = url[:-4] if url.endswith("/api") else url
+        host = (urlparse(url).hostname or "").lower()
+        if "." not in host or host == "localhost":
+            return ""
+        try:
+            ipaddress.ip_address(host)
+            return ""
+        except ValueError:
+            return url
+
+    @property
+    def state_db(self) -> str:
+        return os.path.join(self.data_dir, "state.db")
 
     @property
     def normalized_base_url(self) -> str:
-        """Return the base URL without a trailing slash for clean joining and display."""
-        return self.immich_base_url.rstrip("/")
+        """Immich API URL without a trailing slash. "/api" is added when the server URL is given without it."""
+        url = self.immich_base_url.strip().rstrip("/")
+        return url if url.endswith("/api") else f"{url}/api"
 
 def load_settings() -> Settings:
     """Load settings from .env, applying defaults when absent."""
@@ -44,17 +75,42 @@ def load_settings() -> Settings:
         load_dotenv()
     except Exception:
         pass
-    base = os.getenv("IMMICH_BASE_URL", "http://127.0.0.1:2283/api")
-    api_key = os.getenv("IMMICH_API_KEY", "")
+    def is_http_url(value: str) -> bool:
+        parsed = urlparse(value)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+    # Without these the app can not do its job, so refuse to start instead of failing later
+    problems: list[str] = []
+    base = os.getenv("IMMICH_BASE_URL", "").strip()
+    if not base:
+        problems.append("IMMICH_BASE_URL is not set: the address of your Immich server, e.g. https://immich.example.com")
+    elif not is_http_url(base):
+        problems.append(f"IMMICH_BASE_URL must be a full http(s) URL, e.g. https://immich.example.com (got {base!r})")
+    # Optional: one key for everyone; without it every user saves an API key of their own in the app
+    api_key = os.getenv("IMMICH_API_KEY", "").strip()
+    public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+    if not public_base_url:
+        problems.append("PUBLIC_BASE_URL is not set: the public address of this app, e.g. https://drop.example.com or https://immich.example.com/drop (used for upload links and SSO)")
+    elif not is_http_url(public_base_url):
+        problems.append(f"PUBLIC_BASE_URL must be a full http(s) URL, e.g. https://drop.example.com (got {public_base_url!r})")
+    if problems:
+        raise ConfigError("\n".join(f"  - {p}" for p in problems))
     album_name = os.getenv("IMMICH_ALBUM_NAME", "")
-    # Safe defaults: disable public uploader and invites unless explicitly enabled
+    # Safe defaults
     def as_bool(v: str, default: bool = False) -> bool:
         if v is None:
             return default
         return str(v).strip().lower() in {"1","true","yes","on"}
-    public_upload = as_bool(os.getenv("PUBLIC_UPLOAD_PAGE_ENABLED", "false"), False)
-    state_db = os.getenv("STATE_DB", "/data/state.db")
-    session_secret = os.getenv("SESSION_SECRET") or secrets.token_hex(32)
+    # Subfolder the app is reachable under (e.g. "/drop" for https://immich.example.com/drop).
+    # Taken from the path part of PUBLIC_BASE_URL; empty = served at the root.
+    base_path = (urlparse(public_base_url.strip()).path or "").strip().strip("/")
+    base_path = f"/{base_path}" if base_path else ""
+    # One directory holds everything the app stores: state.db, chunks/ and cookies/
+    data_dir = os.getenv("DATA_DIR", "").strip() or "/data"
+    session_secret = os.getenv("SESSION_SECRET", "").strip()
+    session_secret_generated = not session_secret
+    if session_secret_generated:
+        session_secret = secrets.token_hex(32)
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     chunked_uploads_enabled = as_bool(os.getenv("CHUNKED_UPLOADS_ENABLED", "false"), False)
     try:
@@ -74,15 +130,17 @@ def load_settings() -> Settings:
     instagram_ytdlp_fallback = as_bool(os.getenv("INSTAGRAM_YTDLP_FALLBACK", "false"), False)
     social_media_uploads = as_bool(os.getenv("SOCIAL_MEDIA_UPLOADS_ENABLED", "true"), True)
     test_connection_enabled = as_bool(os.getenv("TEST_CONNECTION_ENABLED", "true"), True)
+    shortcut_enabled = as_bool(os.getenv("SHORTCUT_ENABLED", "false"), False)
     test_connection_show_hostname = as_bool(os.getenv("TEST_CONNECTION_SHOW_HOSTNAME", "true"), True)
     return Settings(
         immich_base_url=base,
         immich_api_key=api_key,
         album_name=album_name,
-        public_upload_page_enabled=public_upload,
-        public_base_url=os.getenv("PUBLIC_BASE_URL", ""),
-        state_db=state_db,
+        public_base_url=public_base_url,
+        base_path=base_path,
+        data_dir=data_dir,
         session_secret=session_secret,
+        session_secret_generated=session_secret_generated,
         log_level=log_level,
         chunked_uploads_enabled=chunked_uploads_enabled,
         chunk_size_mb=chunk_size_mb,
@@ -94,4 +152,5 @@ def load_settings() -> Settings:
         social_media_uploads=social_media_uploads,
         test_connection_enabled=test_connection_enabled,
         test_connection_show_hostname=test_connection_show_hostname,
+        shortcut_enabled=shortcut_enabled,
     )
