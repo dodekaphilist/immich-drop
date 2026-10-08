@@ -1,34 +1,18 @@
+# Copy to docker-compose.yml, fill in the three required values, then: docker compose up -d
+# Optional settings (see .env.example): copy it to .env next to this file; it is picked up automatically.
 services:
   immich-drop:
-    build: .
+    image: ghcr.io/dodekaphilist/immich-drop:latest
     container_name: immich-drop
     restart: unless-stopped
     ports:
-      - "8080:8080"
-
+      - 8080:8080
     environment:
-      #immich drop server ip
-      IMMICH_BASE_URL: https://immich.example.com/api
-      IMMICH_API_KEY: ${IMMICH_API_KEY}
-
+      IMMICH_BASE_URL: https://immich.example.com
       PUBLIC_BASE_URL: https://drop.example.com
-      #Enable/Disable Public upload page to folder
-      PUBLIC_UPLOAD_PAGE_ENABLED: false
-      IMMICH_ALBUM_NAME: dead-drop
-      # Chunked uploads to bypass 100MB limits (e.g., Cloudflare Tunnel)
-      CHUNKED_UPLOADS_ENABLED: true
-      CHUNK_SIZE_MB: 95
-      # Instagram / gallery-dl anti-detection
-      GALLERY_DL_SLEEP_REQUEST: "10-25"
-      GALLERY_DL_SLEEP: "5-15"
-      GALLERY_DL_TIMEOUT: 300
-      DOWNLOAD_CONCURRENCY: 1
-      INSTAGRAM_YTDLP_FALLBACK: false
-
-
+      SESSION_SECRET: change-me-to-a-long-random-string
     volumes:
       - immich_drop_data:/data
-    # Healthcheck ships in the image; override here only if you need different timings
 
 volumes:
   immich_drop_data:
