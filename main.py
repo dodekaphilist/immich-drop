@@ -1,5 +1,5 @@
-"""Thin entrypoint for local development.
-Reads host/port from environment and starts Uvicorn.
+"""Entrypoint: reads host/port from the environment and starts Uvicorn.
+Set RELOAD=true for auto-reload while developing (off by default, also in Docker).
 """
 import os
 import uvicorn
@@ -13,4 +13,5 @@ if __name__ == "__main__":
         pass
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("app.app:app", host=host, port=port, reload=True)
+    reload = os.getenv("RELOAD", "false").strip().lower() in {"1", "true", "yes", "on"}
+    uvicorn.run("app.app:app", host=host, port=port, reload=reload)

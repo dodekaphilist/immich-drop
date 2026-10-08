@@ -6,6 +6,7 @@ them to Netscape cookie file format for yt-dlp and gallery-dl consumption.
 """
 import os
 import sqlite3
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -31,12 +32,10 @@ PLATFORM_DOMAINS = {
     "danbooru": ".donmai.us",
 }
 
-# Cookie directory (inside /data volume)
-COOKIE_DIR = "/data/cookies"
 
 # In-memory cache: { platform: filepath }
 # Invalidated by db_upsert_cookie() and db_delete_cookie()
-_cookie_file_cache: dict[str, str] = {}
+_cookie_file_cache: dict[tuple[str, str], str] = {}  # (user id, platform) -> cookie file
 
 # Staleness threshold (days) -- hardcoded, not user-configurable
 COOKIE_STALE_DAYS = 7
@@ -103,10 +102,7 @@ def to_netscape_format(platform: str, cookies: list[tuple[str, str]]) -> str:
 
 def get_cookie_dir() -> str:
     """Get the cookie directory, creating it if needed."""
-    # Use /data/cookies in production, ./data/cookies in dev
-    cookie_dir = COOKIE_DIR
-    if not os.path.exists("/data"):
-        cookie_dir = "./data/cookies"
+    cookie_dir = os.path.join(os.getenv("DATA_DIR", "").strip() or "/data", "cookies")
 
     os.makedirs(cookie_dir, exist_ok=True)
     return cookie_dir
@@ -122,11 +118,18 @@ def _safe_platform(platform: str) -> str:
     return p
 
 
-def _platform_filepath(platform: str) -> str:
+def _user_dirname(user_id: str) -> str:
+    """Directory name for one user's cookie files ("_" = no user, e.g. the iOS Shortcut)."""
+    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16] if user_id else "_"
+
+
+def _platform_filepath(platform: str, user_id: str = "") -> str:
     """Build a cookie filepath that is provably inside the cookie directory."""
     p = _safe_platform(platform)
     base = Path(get_cookie_dir()).resolve()
-    target = (base / f"{p}.txt").resolve()
+    user_dir = base / _user_dirname(user_id)
+    user_dir.mkdir(exist_ok=True)
+    target = (user_dir / f"{p}.txt").resolve()
     try:
         target.relative_to(base)
     except ValueError:
@@ -134,7 +137,7 @@ def _platform_filepath(platform: str) -> str:
     return str(target)
 
 
-def write_cookie_file(platform: str, cookie_string: str) -> str:
+def write_cookie_file(platform: str, cookie_string: str, user_id: str = "") -> str:
     """
     Write a Netscape format cookie file for the given platform.
 
@@ -146,7 +149,7 @@ def write_cookie_file(platform: str, cookie_string: str) -> str:
         Path to the written cookie file
     """
     p = _safe_platform(platform)
-    filepath = _platform_filepath(p)
+    filepath = _platform_filepath(p, user_id)
     cookies = parse_cookie_string(cookie_string)
     content = to_netscape_format(p, cookies)
 
@@ -162,7 +165,7 @@ def write_cookie_file(platform: str, cookie_string: str) -> str:
     return filepath
 
 
-def delete_cookie_file(platform: str) -> bool:
+def delete_cookie_file(platform: str, user_id: str = "") -> bool:
     """
     Delete the cookie file for a platform.
 
@@ -173,7 +176,7 @@ def delete_cookie_file(platform: str) -> bool:
         True if deleted, False if not found
     """
     try:
-        filepath = _platform_filepath(platform)
+        filepath = _platform_filepath(platform, user_id)
     except ValueError:
         return False
 
@@ -197,9 +200,9 @@ def is_cookie_stale(updated_at: str, stale_days: int = COOKIE_STALE_DAYS) -> boo
         return True
 
 
-def get_cookie_file_for_platform(platform: str, state_db: str) -> Optional[str]:
+def get_cookie_file_for_platform(platform: str, state_db: str, user_id: str = "") -> Optional[str]:
     """
-    Look up cookies for a platform from the database and return the cookie file path.
+    Look up a user's cookies for a platform from the database and return the cookie file path.
 
     Uses an in-memory cache to avoid rewriting the Netscape file on every call.
     Logs a warning when cookies are stale.
@@ -207,6 +210,7 @@ def get_cookie_file_for_platform(platform: str, state_db: str) -> Optional[str]:
     Args:
         platform: Platform name (e.g., "instagram")
         state_db: Path to the SQLite database
+        user_id: Immich user id the cookies belong to ("" = no user)
 
     Returns:
         Path to cookie file, or None if no cookies for this platform
@@ -217,7 +221,8 @@ def get_cookie_file_for_platform(platform: str, state_db: str) -> Optional[str]:
     platform = platform.lower()
 
     # Check cache first to avoid DB query on every download
-    cached_path = _cookie_file_cache.get(platform)
+    cache_key = (user_id, platform)
+    cached_path = _cookie_file_cache.get(cache_key)
     if cached_path and os.path.exists(cached_path):
         logger.debug("Using cached cookie file for %s", platform)
         return cached_path
@@ -227,8 +232,8 @@ def get_cookie_file_for_platform(platform: str, state_db: str) -> Optional[str]:
         conn = sqlite3.connect(state_db)
         cur = conn.cursor()
         cur.execute(
-            "SELECT cookie_string, updated_at FROM platform_cookies WHERE platform = ?",
-            (platform,)
+            "SELECT cookie_string, updated_at FROM platform_cookies WHERE user_id = ? AND platform = ?",
+            (user_id, platform)
         )
         row = cur.fetchone()
         conn.close()
@@ -246,8 +251,8 @@ def get_cookie_file_for_platform(platform: str, state_db: str) -> Optional[str]:
                 platform, updated_at,
             )
 
-        filepath = write_cookie_file(platform, cookie_string)
-        _cookie_file_cache[platform] = filepath
+        filepath = write_cookie_file(platform, cookie_string, user_id)
+        _cookie_file_cache[cache_key] = filepath
         logger.debug("Wrote fresh cookie file for %s at %s", platform, filepath)
         return filepath
 
@@ -258,15 +263,16 @@ def get_cookie_file_for_platform(platform: str, state_db: str) -> Optional[str]:
 
 # Database operations for cookie CRUD
 
-def db_list_cookies(state_db: str) -> list[dict]:
-    """List all platform cookies."""
+def db_list_cookies(state_db: str, user_id: str = "") -> list[dict]:
+    """List a user's platform cookies."""
     try:
         conn = sqlite3.connect(state_db)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
             "SELECT platform, cookie_string, created_at, updated_at "
-            "FROM platform_cookies ORDER BY platform"
+            "FROM platform_cookies WHERE user_id = ? ORDER BY platform",
+            (user_id,),
         )
         rows = cur.fetchall()
         conn.close()
@@ -276,28 +282,28 @@ def db_list_cookies(state_db: str) -> list[dict]:
         return []
 
 
-def db_upsert_cookie(state_db: str, platform: str, cookie_string: str) -> bool:
-    """Create or update a platform cookie."""
+def db_upsert_cookie(state_db: str, platform: str, cookie_string: str, user_id: str = "") -> bool:
+    """Create or update a user's platform cookie."""
     platform = platform.lower()
     try:
         conn = sqlite3.connect(state_db)
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO platform_cookies (platform, cookie_string, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(platform) DO UPDATE SET
+            INSERT INTO platform_cookies (user_id, platform, cookie_string, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, platform) DO UPDATE SET
                 cookie_string = excluded.cookie_string,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (platform, cookie_string)
+            (user_id, platform, cookie_string)
         )
         conn.commit()
         conn.close()
 
         # Also write the cookie file immediately
-        write_cookie_file(platform, cookie_string)
-        _cookie_file_cache.pop(platform, None)
+        write_cookie_file(platform, cookie_string, user_id)
+        _cookie_file_cache.pop((user_id, platform), None)
         logger.info("Saved cookies for platform: %s", platform)
         return True
     except Exception as e:
@@ -305,23 +311,23 @@ def db_upsert_cookie(state_db: str, platform: str, cookie_string: str) -> bool:
         return False
 
 
-def db_delete_cookie(state_db: str, platform: str) -> bool:
-    """Delete a platform cookie."""
+def db_delete_cookie(state_db: str, platform: str, user_id: str = "") -> bool:
+    """Delete a user's platform cookie."""
     platform = platform.lower()
     try:
         conn = sqlite3.connect(state_db)
         cur = conn.cursor()
         cur.execute(
-            "DELETE FROM platform_cookies WHERE platform = ?",
-            (platform,)
+            "DELETE FROM platform_cookies WHERE user_id = ? AND platform = ?",
+            (user_id, platform)
         )
         deleted = cur.rowcount > 0
         conn.commit()
         conn.close()
 
         # Also delete the cookie file
-        delete_cookie_file(platform)
-        _cookie_file_cache.pop(platform, None)
+        delete_cookie_file(platform, user_id)
+        _cookie_file_cache.pop((user_id, platform), None)
 
         if deleted:
             logger.info("Deleted cookies for platform: %s", platform)
