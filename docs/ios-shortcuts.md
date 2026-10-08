@@ -2,9 +2,19 @@
 
 Share a link from any app on your iPhone, download the media, and upload it to Immich.
 
+## Enable it on the server
+
+The shortcut endpoints are **off by default**. Turn them on with:
+
+```env
+SHORTCUT_ENABLED=true
+```
+
+Then every user generates their own token in the app: cog icon > *iOS Shortcut token*. The token is shown once; generating a new one replaces the old, and deleting it revokes access. Every request must send the token as `Authorization: Bearer <token>`; requests without a valid token are rejected with 401. Uploads and downloads made this way use the API key and the platform cookies of the token's owner. Use HTTPS.
+
 ## Download the Shortcut
 
-**[Download "Dead-Drop" Shortcut](Dead-Drop.shortcut)**
+Download it in the app: cog icon > *iOS Shortcut token* > download button (or [from the repository](../app/assets/Immich-Drop.shortcut)).
 
 Supports TikTok, Instagram, Facebook, Reddit, YouTube, Twitter/X, Flickr, Imgur, Tumblr, Pinterest, Bluesky, and direct image URLs.
 
@@ -15,13 +25,14 @@ Supports TikTok, Instagram, Facebook, Reddit, YouTube, Twitter/X, Flickr, Imgur,
 3. Find the two `https://YOUR-SERVER-HERE.example.com` URLs and replace with your server:
    - The POST URL: `https://your-server.com/api/upload/url`
    - The status poll URL: `https://your-server.com/api/upload/url/status/`
-4. Or rebuild with your server URL using `docs/build-shortcut.py` (see below)
+4. In both "Get Contents of URL" actions, open **Show More -> Headers** and add `Authorization` = `Bearer <your token>`
+5. Or rebuild with your server URL and token using `docs/build-shortcut.py` (see below). This needs macOS for `shortcuts sign`; the pre-built `.shortcut` file has no token, so use step 4 with it
 
 ## Usage
 
 1. Open TikTok, Instagram, Facebook, Reddit, YouTube, Twitter, or other supported platforms
 2. Find a video/post you want to save
-3. Tap Share -> "Dead-Drop"
+3. Tap Share -> "Immich Drop"
 4. The shortcut submits the URL, polls for completion, and shows a notification when done
 
 ## How It Works
@@ -42,26 +53,30 @@ This handles slow downloads (Instagram with anti-detection sleep delays can take
 The shortcut is built programmatically from `docs/build-shortcut.py`:
 
 ```bash
-# Edit SERVER variable in build-shortcut.py first
+# Edit the SERVER and TOKEN variables in build-shortcut.py first
 python docs/build-shortcut.py
-# Output: ~/Downloads/Dead-Drop.shortcut
+# Output: ~/Downloads/Immich-Drop.shortcut
 ```
 
 The script generates an unsigned plist and signs it with `shortcuts sign`. The signed `.shortcut` file can be imported on any iOS device.
 
 ### Why not build it by hand?
 
-`shortcuts sign` silently strips parameters from the plist. String comparisons, number comparisons, explicit HTTP bodies -- all gone after signing. The only way to get a working shortcut with conditional logic is to know which parameter formats survive and which don't. The script handles that. See `ios-shortcuts-plist-reference.md` for the full list of quirks.
+`shortcuts sign` silently strips parameters from the plist. String comparisons, number comparisons, explicit HTTP bodies -- all gone after signing. The only way to get a working shortcut with conditional logic is to know which parameter formats survive and which don't. The script handles that.
 
 ---
 
 ## API Reference
 
+All endpoints need `Authorization: Bearer <your token>` (or a logged-in browser session).
+
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/upload/url` | POST | Submit URL for async download (returns job_id) |
+| `/api/upload/url` | POST | Submit URL for async download (returns job_id); optional `album_name` (empty string = no album, omitted = `IMMICH_ALBUM_NAME`) |
 | `/api/upload/url/status/{job_id}` | GET | Poll job status |
-| `/api/upload/base64` | POST | Upload base64-encoded file (JSON: data, filename) |
+| `/api/upload/base64` | POST | Upload base64-encoded file (JSON: data, filename, album_name) |
+| `/api/upload/file` | POST | Upload one file (multipart: file, album_name) |
+| `/api/upload/batch` | POST | Upload several files (multipart: files[], album_name) |
 | `/api/upload/urls` | POST | Batch URL downloads (JSON: urls[], max 10) |
 | `/api/supported-platforms` | GET | List supported URL platforms |
 
@@ -103,19 +118,22 @@ On failure:
 
 ## Troubleshooting
 
+### Shortcut gets 401 / "Login required"
+- The server needs `SHORTCUT_ENABLED=true`, and the token must come from the settings of an existing user
+- Both "Get Contents of URL" actions need the header `Authorization: Bearer <token>`
+
 ### Shortcut shows "Upload failed"
 - Check server logs for the actual error
 - Reddit posts may fail with 429 (rate limited) -- wait a few minutes and retry
-- Instagram requires fresh cookies configured in the admin menu
+- Instagram requires fresh cookies configured under "Cookies" in the web UI
 
 ### Shortcut keeps polling without completing
-- Check that your server is running v1.6.0+
 - The status endpoint must return `result` or `error` fields only when the job is done
 - Jobs expire after 10 minutes
 
 ### "Unsupported URL" error
 - Make sure you're sharing the video/post URL, not just text
-- See the [full list of supported platforms](../README.md#url-downloads) in the README
+- See the [full list of supported platforms](../README.md#download-from-platforms) in the README
 
 ### Instagram downloads slow
 - Anti-detection sleep delays (10-25 seconds between requests) are intentional
@@ -123,5 +141,5 @@ On failure:
 
 ### Reddit image posts failing
 - Some Reddit image posts redirect through `reddit.com/media?url=` which gallery-dl and yt-dlp can't handle directly
-- Server v1.6.1+ extracts the embedded image URL automatically
+- The server extracts the embedded image URL automatically
 - If you see 429 errors, Reddit is rate-limiting you -- wait a few minutes

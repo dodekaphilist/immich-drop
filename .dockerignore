@@ -23,10 +23,18 @@ build/
 
 # Local data, screenshots, and env files
 data/
-screenshot.png
 .env
 *.env
 agent.md
 docs/
 CHANGELOG.md
 CLAUDE.md
+
+# Svelte login app
+web/node_modules/
+web/build/
+web/.svelte-kit/
+frontend/app/
+
+# Brand source files (not needed at runtime)
+branding/

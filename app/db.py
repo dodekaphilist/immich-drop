@@ -24,22 +24,86 @@ def connect() -> sqlite3.Connection:
     return sqlite3.connect(_DB_PATH, timeout=10)
 
 
+def _migrate_uploads_owner(cur: sqlite3.Cursor) -> None:
+    """Scope the duplicate cache per Immich account: UNIQUE(checksum) becomes UNIQUE(owner_id, checksum)."""
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(uploads)").fetchall()]
+    if cols and "owner_id" not in cols:
+        cur.execute("ALTER TABLE uploads RENAME TO uploads_old")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS uploads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id TEXT NOT NULL DEFAULT '',
+            checksum TEXT,
+            filename TEXT,
+            size INTEGER,
+            device_asset_id TEXT,
+            immich_asset_id TEXT,
+            created_at TEXT,
+            inserted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (owner_id, checksum)
+        );
+        """
+    )
+    if cols and "owner_id" not in cols:
+        cur.execute(
+            "INSERT OR IGNORE INTO uploads (checksum, filename, size, device_asset_id, immich_asset_id, created_at, inserted_at) "
+            "SELECT checksum, filename, size, device_asset_id, immich_asset_id, created_at, inserted_at FROM uploads_old"
+        )
+        cur.execute("DROP TABLE uploads_old")
+
+
+def _migrate_cookies_owner(cur: sqlite3.Cursor) -> None:
+    """Cookies belong to a user: UNIQUE(platform) becomes UNIQUE(user_id, platform).
+
+    Cookies saved before stay with user_id '' (the iOS Shortcut and other requests without a login use those).
+    """
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(platform_cookies)").fetchall()]
+    old = bool(cols) and "user_id" not in cols
+    if old:
+        cur.execute("ALTER TABLE platform_cookies RENAME TO platform_cookies_old")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS platform_cookies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL DEFAULT '',
+            platform TEXT NOT NULL,
+            cookie_string TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (user_id, platform)
+        );
+        """
+    )
+    if old:
+        cur.execute(
+            "INSERT OR IGNORE INTO platform_cookies (platform, cookie_string, created_at, updated_at) "
+            "SELECT platform, cookie_string, created_at, updated_at FROM platform_cookies_old"
+        )
+        cur.execute("DROP TABLE platform_cookies_old")
+
+
 def init_db() -> None:
     """Create all tables and run best-effort column migrations (idempotent)."""
     conn = connect()
     try:
         cur = conn.cursor()
+        _migrate_uploads_owner(cur)
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS uploads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                checksum TEXT UNIQUE,
-                filename TEXT,
-                size INTEGER,
-                device_asset_id TEXT,
-                immich_asset_id TEXT,
-                created_at TEXT,
-                inserted_at TEXT DEFAULT CURRENT_TIMESTAMP
+            CREATE TABLE IF NOT EXISTS shortcut_tokens (
+                user_id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_keys (
+                user_id TEXT PRIMARY KEY,
+                api_key TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -72,17 +136,7 @@ def init_db() -> None:
                 cur.execute(ddl)
             except sqlite3.OperationalError:
                 pass
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS platform_cookies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                platform TEXT NOT NULL UNIQUE,
-                cookie_string TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
+        _migrate_cookies_owner(cur)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS upload_events (

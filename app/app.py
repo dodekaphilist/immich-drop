@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 import httpx
 import logging
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Request, Form
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -40,7 +40,7 @@ try:
 except Exception:
     qrcode = None
 
-from app.config import Settings, load_settings
+from app.config import ConfigError, Settings, load_settings
 from app import db, immich_client
 from app.immich_client import to_immich_iso
 from app.job_manager import cleanup_expired
@@ -85,7 +85,12 @@ app.add_middleware(
 )
 
 # Global settings (read-only at runtime)
-SETTINGS: Settings = load_settings()
+try:
+    SETTINGS: Settings = load_settings()
+except ConfigError as exc:
+    logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("immich_drop").critical("Not starting: the configuration is incomplete.\n%s", exc)
+    raise SystemExit(1)
 
 # Basic logging setup using settings
 logging.basicConfig(level=SETTINGS.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -96,20 +101,62 @@ for _noisy in ("PIL", "python_multipart", "httpcore", "urllib3", "websockets", "
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.INFO)
 logger = logging.getLogger("immich_drop")
+if SETTINGS.session_secret_generated:
+    logger.warning("SESSION_SECRET is not set: a random one is used, so all logins end whenever the app restarts")
+if not SETTINGS.immich_base_url.rstrip("/").endswith("/api"):
+    logger.info("Using the Immich API at %s", SETTINGS.normalized_base_url)
 
-# Cookie-based session for short-lived auth token storage (no persistence)
-app.add_middleware(SessionMiddleware, secret_key=SETTINGS.session_secret, same_site="lax")
+# Cookie-based session for short-lived auth token storage (no persistence).
+# Scoped to the subfolder when there is one, so it is not sent to other apps on the same host.
+app.add_middleware(SessionMiddleware, secret_key=SETTINGS.session_secret, same_site="lax", path=SETTINGS.base_path or "/")
+
+
+class BasePathMiddleware:
+    """Serve the app under a subfolder such as /drop.
+
+    A reverse proxy may forward the prefix (/drop/login) or strip it (/login). Either way the routes see the
+    unprefixed path: the prefix is removed here when present and left alone when it is not.
+    (Not done via root_path: Starlette's static mounts then fail to find files once the proxy has stripped it.)
+    """
+
+    def __init__(self, app, base_path: str) -> None:
+        self.app = app
+        self.base_path = base_path
+        self._raw = base_path.encode()
+
+    async def __call__(self, scope, receive, send):
+        if self.base_path and scope["type"] in ("http", "websocket"):
+            path = scope["path"]
+            if path == self.base_path or path.startswith(self.base_path + "/"):
+                scope = {**scope, "path": path[len(self.base_path):] or "/"}
+                raw = scope.get("raw_path")
+                if raw and (raw == self._raw or raw.startswith(self._raw + b"/") or raw.startswith(self._raw + b"?")):
+                    scope["raw_path"] = raw[len(self._raw):] or b"/"
+        await self.app(scope, receive, send)
+
+
+# Added last so it wraps everything else
+app.add_middleware(BasePathMiddleware, base_path=SETTINGS.base_path)
+
+
+def _u(path: str) -> str:
+    """Absolute path for a Location header or link, including the subfolder."""
+    return f"{SETTINGS.base_path}{path}"
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+# Svelte app (built in the Docker image): hashed assets are referenced as /_app/*
+_APP_ASSETS = os.path.join(FRONTEND_DIR, "app", "_app")
+if os.path.isdir(_APP_ASSETS):
+    app.mount("/_app", StaticFiles(directory=_APP_ASSETS), name="app_assets")
 
 # Include URL/batch upload routes
 from .api_routes import create_api_routes
-api_router = create_api_routes(SETTINGS)
+api_router = create_api_routes(SETTINGS, lambda user_id: key_for_user(user_id))
 app.include_router(api_router)
 
 # Chunk upload storage
-CHUNK_ROOT = os.getenv("CHUNK_DIR", "/data/chunks")
+CHUNK_ROOT = os.path.join(SETTINGS.data_dir, "chunks")
 try:
     os.makedirs(CHUNK_ROOT, exist_ok=True)
 except Exception:
@@ -120,49 +167,50 @@ _CHUNK_ROOT_PREFIX = str(_CHUNK_ROOT_RESOLVED) + os.sep
 CHUNK_TTL_SECONDS = 6 * 60 * 60
 
 # Album cache
-ALBUM_ID: Optional[str] = None
+ALBUM_IDS: Dict[str, str] = {}  # default album id per Immich account ("" = server key)
 # Lock to prevent concurrent album creation race conditions
 _album_lock = asyncio.Lock()
 
 def reset_album_cache() -> None:
     """Invalidate the cached Immich album id so next use re-resolves it."""
-    global ALBUM_ID
-    ALBUM_ID = None
+    ALBUM_IDS.clear()
 
 # ---------- DB (local dedupe cache) ----------
 # All tables (uploads, invites, platform_cookies, upload_events) are created
 # once at startup in db.init_db().
 
+with suppress(Exception):
+    os.makedirs(SETTINGS.data_dir, exist_ok=True)
 db.configure(SETTINGS.state_db)
 db.init_db()
 
-def db_lookup_checksum(checksum: str) -> Optional[dict]:
-    """Return a record for the given checksum if seen before (None if not)."""
+def db_lookup_checksum(checksum: str, owner: str = "") -> Optional[dict]:
+    """Return a record for the given checksum if this Immich account uploaded it before (None if not)."""
     conn = db.connect()
     cur = conn.cursor()
-    cur.execute("SELECT checksum, immich_asset_id FROM uploads WHERE checksum = ?", (checksum,))
+    cur.execute("SELECT checksum, immich_asset_id FROM uploads WHERE owner_id = ? AND checksum = ?", (owner, checksum))
     row = cur.fetchone()
     conn.close()
     if row:
         return {"checksum": row[0], "immich_asset_id": row[1]}
     return None
 
-def db_lookup_device_asset(device_asset_id: str) -> bool:
+def db_lookup_device_asset(device_asset_id: str, owner: str = "") -> bool:
     """True if a deviceAssetId has been uploaded by this service previously."""
     conn = db.connect()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM uploads WHERE device_asset_id = ?", (device_asset_id,))
+    cur.execute("SELECT 1 FROM uploads WHERE owner_id = ? AND device_asset_id = ?", (owner, device_asset_id))
     row = cur.fetchone()
     conn.close()
     return bool(row)
 
-def db_insert_upload(checksum: str, filename: str, size: int, device_asset_id: str, immich_asset_id: Optional[str], created_at: str) -> None:
+def db_insert_upload(checksum: str, filename: str, size: int, device_asset_id: str, immich_asset_id: Optional[str], created_at: str, owner: str = "") -> None:
     """Insert a newly-uploaded asset into the local cache (ignore on duplicates)."""
     conn = db.connect()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO uploads (checksum, filename, size, device_asset_id, immich_asset_id, created_at) VALUES (?,?,?,?,?,?)",
-        (checksum, filename, size, device_asset_id, immich_asset_id, created_at)
+        "INSERT OR IGNORE INTO uploads (owner_id, checksum, filename, size, device_asset_id, immich_asset_id, created_at) VALUES (?,?,?,?,?,?,?)",
+        (owner, checksum, filename, size, device_asset_id, immich_asset_id, created_at)
     )
     conn.commit()
     conn.close()
@@ -300,44 +348,87 @@ def immich_headers(request: Optional[Request] = None) -> dict:
         headers["x-api-key"] = SETTINGS.immich_api_key
     return headers
 
-async def get_or_create_album(request: Optional[Request] = None, album_name_override: Optional[str] = None) -> Optional[str]:
+def stored_api_key(user_id: str) -> Optional[str]:
+    """The API key a user saved in the app (None if there is none)."""
+    if not user_id:
+        return None
+    try:
+        conn = db.connect()
+        row = conn.execute("SELECT api_key FROM user_keys WHERE user_id = ?", (user_id,)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.exception("API key lookup failed: %s", e)
+        return None
+    return row[0] if row else None
+
+def key_headers(user_id: str) -> tuple[Optional[dict], str]:
+    """Headers for acting as an Immich account without a login: IMMICH_API_KEY if set, else the user's own key.
+
+    Returns (headers or None if no key exists, dedupe owner). The owner is the user id when the user's own key is
+    used and "" for the server key, so the local duplicate cache never mixes libraries.
+    """
+    if SETTINGS.immich_api_key:
+        return {"Accept": "application/json", "x-api-key": SETTINGS.immich_api_key}, ""
+    own = stored_api_key(user_id)
+    if own:
+        return {"Accept": "application/json", "x-api-key": own}, user_id
+    return None, ""
+
+def key_for_user(user_id: str) -> Optional[str]:
+    """API key for work done on behalf of a user (downloads, shortcut): IMMICH_API_KEY, else their own."""
+    return SETTINGS.immich_api_key or stored_api_key(user_id) or None
+
+def invite_owner_id(invite_token: str) -> Optional[str]:
+    """Owner (Immich user id) of a link; None if the link does not exist."""
+    try:
+        conn = db.connect()
+        row = conn.execute("SELECT COALESCE(owner_user_id,'') FROM invites WHERE token = ?", (invite_token,)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.exception("Invite owner lookup failed: %s", e)
+        return None
+    return row[0] if row else None
+
+async def get_or_create_album(request: Optional[Request] = None, album_name_override: Optional[str] = None, headers: Optional[dict] = None, owner: Optional[str] = None) -> Optional[str]:
     """Get existing album by name or create a new one. Returns album ID or None.
 
     Uses a lock to prevent race conditions when multiple concurrent uploads
-    try to create the same album simultaneously.
+    try to create the same album simultaneously. The default album is cached per Immich account.
     """
-    global ALBUM_ID
     album_name = album_name_override if album_name_override is not None else SETTINGS.album_name
     # Skip if no album name configured
     if not album_name:
         return None
+    if owner is None:
+        owner = str(request.session.get("userId") or "") if request is not None else ""
+    use_cache = album_name_override is None
     # Return cached album ID if already fetched and using default settings name
-    if album_name_override is None and ALBUM_ID:
-        return ALBUM_ID
+    if use_cache and ALBUM_IDS.get(owner):
+        return ALBUM_IDS[owner]
 
     # Use lock to prevent concurrent album creation race conditions
     async with _album_lock:
         # Double-check cache after acquiring lock (another request may have set it)
-        if album_name_override is None and ALBUM_ID:
-            return ALBUM_ID
+        if use_cache and ALBUM_IDS.get(owner):
+            return ALBUM_IDS[owner]
 
         found_id = await immich_client.find_or_create_album(
             app.state.httpx_client,
             SETTINGS.normalized_base_url,
-            immich_headers(request),
+            headers or immich_headers(request),
             album_name,
             description="Auto-created album for Immich Drop uploads",
         )
-        if found_id and album_name_override is None:
-            ALBUM_ID = found_id
-            logger.info("Resolved album '%s' to ID: %s", album_name, ALBUM_ID)
+        if found_id and use_cache:
+            ALBUM_IDS[owner] = found_id
+            logger.info("Resolved album '%s' to ID: %s", album_name, found_id)
         return found_id
 
-async def add_asset_to_album(asset_id: str, request: Optional[Request] = None, album_id_override: Optional[str] = None, album_name_override: Optional[str] = None, headers_override: Optional[dict] = None) -> bool:
+async def add_asset_to_album(asset_id: str, request: Optional[Request] = None, album_id_override: Optional[str] = None, album_name_override: Optional[str] = None, headers_override: Optional[dict] = None, owner: Optional[str] = None) -> bool:
     """Add an asset to the configured album. Returns True on success."""
     album_id = album_id_override
     if not album_id:
-        album_id = await get_or_create_album(request=request, album_name_override=album_name_override)
+        album_id = await get_or_create_album(request=request, album_name_override=album_name_override, headers=headers_override, owner=owner)
     if not album_id or not asset_id:
         return False
     return await immich_client.add_to_album(
@@ -346,14 +437,12 @@ async def add_asset_to_album(asset_id: str, request: Optional[Request] = None, a
 
 async def immich_ping() -> bool:
     """Best-effort reachability check against a few Immich endpoints."""
-    if not SETTINGS.immich_api_key:
-        return False
     return await immich_client.ping(app.state.httpx_client, SETTINGS.normalized_base_url, immich_headers())
 
-async def immich_bulk_check(checks: List[dict]) -> Dict[str, dict]:
+async def immich_bulk_check(checks: List[dict], headers: dict) -> Dict[str, dict]:
     """Try Immich bulk upload check; return map id->result (or empty on failure)."""
     return await immich_client.bulk_upload_check(
-        app.state.httpx_client, SETTINGS.normalized_base_url, immich_headers(), checks
+        app.state.httpx_client, SETTINGS.normalized_base_url, headers, checks
     )
 
 async def send_progress(session_id: str, item_id: str, status: str, progress: int = 0, message: str = "", response_id: Optional[str] = None) -> None:
@@ -368,24 +457,42 @@ async def send_progress(session_id: str, item_id: str, status: str, progress: in
 
 # ---------- Routes ----------
 
+_SPA_HTML: Optional[str] = None
+
+def _spa() -> HTMLResponse:
+    """Serve the Svelte app shell; the client router renders the actual page.
+
+    The UI is built once with root-relative URLs. Under a subfolder they are rewritten here, and the router's
+    `base` is set, so the same build works at the root and at e.g. /drop.
+    """
+    global _SPA_HTML
+    if _SPA_HTML is None:
+        with open(os.path.join(FRONTEND_DIR, "app", "index.html"), encoding="utf-8") as f:
+            html = f.read()
+        base = SETTINGS.base_path
+        if base:
+            html = (
+                html.replace('"/_app/', f'"{base}/_app/')
+                .replace('"/static/', f'"{base}/static/')
+                .replace('base: ""', f'base: "{base}"')
+            )
+        _SPA_HTML = html
+    return HTMLResponse(_SPA_HTML, headers={"Cache-Control": "no-store"})
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    """Serve the SPA (frontend/index.html) or redirect to login if disabled."""
-    if not SETTINGS.public_upload_page_enabled:
-        return RedirectResponse(url="/login")
-    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+    """Owner upload page. Requires login."""
+    if not request.session.get("accessToken"):
+        return RedirectResponse(url=_u("/login"))
+    return _spa()
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page(_: Request) -> HTMLResponse:
-    """Serve the login page."""
-    return FileResponse(os.path.join(FRONTEND_DIR, "login.html"))
+async def login_page(request: Request) -> HTMLResponse:
+    """Login page; already logged-in users go straight to the uploader."""
+    if request.session.get("accessToken"):
+        return RedirectResponse(url=_u("/"))
+    return _spa()
 
-@app.get("/menu", response_class=HTMLResponse)
-async def menu_page(request: Request) -> HTMLResponse:
-    """Serve the menu page for creating invite links. Requires login."""
-    if not request.session.get("accessToken"):
-        return RedirectResponse(url="/login")
-    return FileResponse(os.path.join(FRONTEND_DIR, "menu.html"))
 
 try:
     with open(os.path.join(FRONTEND_DIR, "favicon.png"), "rb") as _f:
@@ -415,12 +522,12 @@ async def api_ping() -> dict:
 async def api_config() -> dict:
     """Expose minimal public configuration flags for the frontend."""
     return {
-        "public_upload_page_enabled": SETTINGS.public_upload_page_enabled,
         "chunked_uploads_enabled": SETTINGS.chunked_uploads_enabled,
         "chunk_size_mb": SETTINGS.chunk_size_mb,
         "version": VERSION,
         "social_media_uploads": SETTINGS.social_media_uploads,
         "test_connection_enabled": SETTINGS.test_connection_enabled,
+        "default_album": SETTINGS.album_name,
     }
 
 @app.websocket("/ws")
@@ -545,168 +652,6 @@ def check_invite_for_upload(request: Request, invite_token: str, session_id: str
             return ("Invite already used up", "invite_exhausted", 403), None, None
     return None, album_id, album_name
 
-# ---------- Immich native Shared Links (immich-public-proxy compatible) ----------
-# Lets a link created directly in Immich (Sharing -> Create link, with
-# "Allow public user to upload" enabled) be used at /invite/{key} without any
-# local invite record. Metadata (name/password/expiry/album) is always read
-# live from Immich; the upload and album-add calls authenticate with the share
-# key alone, matching the key-only trust model immich-public-proxy uses for
-# viewing shares. The pre-upload duplicate check in process_upload still runs
-# with the app's own credentials, so IMMICH_API_KEY is not made optional by
-# this flow.
-
-def _share_token_for(request: Request, key: str) -> Optional[str]:
-    """This visitor's Immich unlock token for a password-protected share, if any.
-
-    Stored per browser session by immich_share_auth. It must never live in the
-    shared httpx client's cookie jar, which is process-wide.
-    """
-    try:
-        return (request.session.get("immichShareTokens") or {}).get(key)
-    except Exception:
-        return None
-
-def _immich_share_from_result(result: dict) -> dict:
-    album = result.get("album") or {}
-    return {
-        "albumId": album.get("id"),
-        "albumName": album.get("albumName"),
-        "type": result.get("type"),
-        "allowUpload": bool(result.get("allowUpload")),
-        "expiresAt": result.get("expiresAt"),
-        "description": result.get("description"),
-    }
-
-async def fetch_immich_share(request: Request, key: str) -> tuple[Optional[dict], int]:
-    """Look up an Immich shared link by key, scoped to this visitor's session."""
-    result, status = await immich_client.get_shared_link(
-        app.state.httpx_client, SETTINGS.normalized_base_url, key, share_token=_share_token_for(request, key)
-    )
-    if status == 200 and result:
-        return _immich_share_from_result(result), 200
-    return None, status
-
-async def check_immich_share_for_upload(request: Request, key: str):
-    """Validate an Immich native Shared Link (by key) for an upload attempt.
-
-    Returns (error, album_id, album_name, share_key) with the same error
-    shape as check_invite_for_upload; share_key signals the caller to
-    authenticate Immich calls with the share key instead of admin creds.
-    """
-    data, status = await fetch_immich_share(request, key)
-    if status == 401:
-        return ("Password required", "invite_password_required", 403), None, None, None
-    if not data:
-        return ("Invalid invite token", "invalid_invite", 403), None, None, None
-    if data.get("type") != "ALBUM" or not data.get("albumId"):
-        return ("Share does not target an album", "invalid_invite", 403), None, None, None
-    if not data.get("allowUpload"):
-        return ("Share does not allow uploads", "invite_disabled", 403), None, None, None
-    expires_at = data.get("expiresAt")
-    if expires_at:
-        try:
-            exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-            if datetime.now(timezone.utc) > exp:
-                return ("Invite expired", "invite_expired", 403), None, None, None
-        except Exception:
-            pass
-    return None, data.get("albumId"), data.get("albumName"), key
-
-async def check_invite_or_share_for_upload(request: Request, invite_token: str, session_id: str):
-    """Resolve an invite_token against local invites, falling back to an
-    Immich native Shared Link key. Returns (error, album_id, album_name, share_key)."""
-    try:
-        conn = db.connect()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM invites WHERE token = ?", (invite_token,))
-        is_local = cur.fetchone() is not None
-        conn.close()
-    except Exception:
-        is_local = False
-    if is_local:
-        error, album_id, album_name = check_invite_for_upload(request, invite_token, session_id)
-        return error, album_id, album_name, None
-    return await check_immich_share_for_upload(request, invite_token)
-
-async def immich_share_info(key: str, request: Request) -> JSONResponse:
-    """/api/invite/{token} fallback: describe an Immich native Shared Link.
-
-    Mirrors the local-invite response shape so the existing invite.html page
-    (same layout) renders it without any frontend changes.
-    """
-    data, status = await fetch_immich_share(request, key)
-    if status == 401:
-        return JSONResponse({
-            "token": key,
-            "albumId": None,
-            "albumName": None,
-            "name": None,
-            "maxUses": -1,
-            "used": 0,
-            "remaining": None,
-            "expiresAt": None,
-            "oneTime": False,
-            "claimed": False,
-            "claimedAt": None,
-            "expired": False,
-            "active": True,
-            "inactiveReason": None,
-            "passwordRequired": True,
-            "authorized": False,
-        })
-    if not data:
-        return JSONResponse({"error": "not_found"}, status_code=404)
-    expired = False
-    if data.get("expiresAt"):
-        try:
-            expired = datetime.now(timezone.utc) > datetime.fromisoformat(str(data["expiresAt"]).replace("Z", "+00:00"))
-        except Exception:
-            pass
-    active = data.get("type") == "ALBUM" and bool(data.get("albumId")) and bool(data.get("allowUpload")) and not expired
-    reason = None
-    if not active:
-        reason = "expired" if expired else ("no_upload" if not data.get("allowUpload") else "invalid")
-    return JSONResponse({
-        "token": key,
-        "albumId": data.get("albumId"),
-        "albumName": data.get("albumName"),
-        "name": data.get("description") or data.get("albumName"),
-        "maxUses": -1,
-        "used": 0,
-        "remaining": None,
-        "expiresAt": data.get("expiresAt"),
-        "oneTime": False,
-        "claimed": False,
-        "claimedAt": None,
-        "expired": expired,
-        "active": active,
-        "inactiveReason": (None if active else reason),
-        "passwordRequired": False,
-        "authorized": True,
-    })
-
-async def immich_share_auth(key: str, request: Request, provided_password: Optional[str]) -> JSONResponse:
-    """/api/invite/{token}/auth fallback: validate a share password against Immich itself."""
-    if not provided_password:
-        return JSONResponse({"error": "invalid_password"}, status_code=403)
-    result, share_token, status = await immich_client.shared_link_login(
-        SETTINGS.normalized_base_url, key, provided_password
-    )
-    if status != 200 or not result:
-        return JSONResponse({"error": "invalid_password"}, status_code=403)
-    if not share_token:
-        # Without the unlock token every later /shared-links/me is still 401,
-        # so uploads would fail after an apparently successful password entry.
-        logger.warning("Shared-link login for %s returned no unlock token", key)
-        return JSONResponse({"error": "invalid_password"}, status_code=403)
-    tokens = request.session.get("immichShareTokens") or {}
-    tokens[key] = share_token
-    request.session["immichShareTokens"] = tokens
-    ia = request.session.get("inviteAuth") or {}
-    ia[key] = True
-    request.session["inviteAuth"] = ia
-    return JSONResponse({"ok": True, "authorized": True})
-
 def increment_invite_usage(invite_token: str) -> None:
     """Bump used_count after a successful upload (one-time stays at 1)."""
     try:
@@ -747,6 +692,13 @@ def log_upload_event(request: Request, invite_token: Optional[str], fingerprint:
     except Exception:
         pass
 
+# Items the client asked to cancel: (session_id, item_id) -> time. Cancelling only needs those two client-made
+# random ids, the same capability the WebSocket progress uses.
+_CANCELLED: Dict[tuple, float] = {}
+
+def _upload_cancelled(session_id: str, item_id: str) -> bool:
+    return (session_id, item_id) in _CANCELLED
+
 async def process_upload(
     request: Request,
     *,
@@ -758,10 +710,31 @@ async def process_upload(
     last_modified: Optional[int],
     invite_token: Optional[str],
     fingerprint: Optional[str],
+    album_name: Optional[str] = None,
 ) -> JSONResponse:
     """Dedupe-check and forward one file to Immich, streaming progress via WS."""
+    if denied := _upload_not_allowed(request, invite_token):
+        return denied
     size = len(raw)
+    if _upload_cancelled(session_id, item_id):
+        _CANCELLED.pop((session_id, item_id), None)
+        await send_progress(session_id, item_id, "cancelled", 100)
+        return JSONResponse({"status": "cancelled"}, status_code=200)
     checksum = sha1_hex(raw)
+
+    # Whose Immich account receives the file: a link's owner (via their own or the server key), or the logged-in user
+    if invite_token:
+        link_owner = invite_owner_id(invite_token)
+        if link_owner is None:
+            await send_progress(session_id, item_id, "error", 100, "Invalid invite token")
+            return JSONResponse({"error": "invalid_invite"}, status_code=403)
+        upload_headers, owner = key_headers(link_owner)
+        if upload_headers is None:
+            logger.warning("Upload via link %s...: its owner has no API key and IMMICH_API_KEY is not set", invite_token[:6])
+            await send_progress(session_id, item_id, "error", 100, "Uploads are not available for this link")
+            return JSONResponse({"error": "no_api_key"}, status_code=503)
+    else:
+        upload_headers, owner = immich_headers(request), str(request.session.get("userId") or "")
 
     exif_created, exif_modified = read_exif_datetimes(raw)
     created_at = exif_created or (datetime.fromtimestamp(last_modified / 1000, tz=timezone.utc) if last_modified else datetime.now(timezone.utc))
@@ -771,37 +744,30 @@ async def process_upload(
     # Local dedupe key only; Immich v3 no longer accepts deviceAssetId/deviceId
     device_asset_id = f"{orig_name}-{last_modified or 0}-{size}"
 
-    if db_lookup_checksum(checksum):
+    if db_lookup_checksum(checksum, owner):
         await send_progress(session_id, item_id, "duplicate", 100, "Duplicate (by checksum - local cache)")
         return JSONResponse({"status": "duplicate", "id": None}, status_code=200)
-    if db_lookup_device_asset(device_asset_id):
+    if db_lookup_device_asset(device_asset_id, owner):
         await send_progress(session_id, item_id, "duplicate", 100, "Already uploaded from this device (local cache)")
         return JSONResponse({"status": "duplicate", "id": None}, status_code=200)
 
     await send_progress(session_id, item_id, "checking", 2, "Checking duplicates…")
-    bulk = await immich_bulk_check([{"id": item_id, "checksum": checksum}])
+    bulk = await immich_bulk_check([{"id": item_id, "checksum": checksum}], upload_headers)
     if bulk.get(item_id, {}).get("action") == "reject" and bulk[item_id].get("reason") == "duplicate":
         asset_id = bulk[item_id].get("assetId")
-        db_insert_upload(checksum, orig_name, size, device_asset_id, asset_id, created_iso)
+        db_insert_upload(checksum, orig_name, size, device_asset_id, asset_id, created_iso, owner)
         await send_progress(session_id, item_id, "duplicate", 100, "Duplicate (server)", asset_id)
         return JSONResponse({"status": "duplicate", "id": asset_id}, status_code=200)
 
-    # Invite token validation (if provided); falls back to an Immich native
-    # Shared Link key when the token isn't a local invite (see
-    # check_invite_or_share_for_upload).
+    # Invite token validation (if provided)
     target_album_id: Optional[str] = None
     target_album_name: Optional[str] = None
-    share_key: Optional[str] = None
     if invite_token:
-        error, target_album_id, target_album_name, share_key = await check_invite_or_share_for_upload(request, invite_token, session_id)
+        error, target_album_id, target_album_name = check_invite_for_upload(request, invite_token, session_id)
         if error:
             msg, key, http_status = error
             await send_progress(session_id, item_id, "error", 100, msg)
             return JSONResponse({"error": key}, status_code=http_status)
-
-    # Immich Shared Links authenticate purely via the key (allowUpload grants
-    # write access); local invites keep using the app's own Immich credentials.
-    upload_headers = immich_client.share_key_headers(share_key) if share_key else immich_headers(request)
 
     safe_name = sanitize_filename(orig_name)
     await send_progress(session_id, item_id, "uploading", 0, "Uploading…")
@@ -820,8 +786,13 @@ async def process_upload(
         created_at=created_at,
         modified_at=modified_at,
         progress=on_progress,
+        should_cancel=lambda: _upload_cancelled(session_id, item_id),
         timeout=300.0,
     )
+    if outcome.cancelled:
+        _CANCELLED.pop((session_id, item_id), None)
+        await send_progress(session_id, item_id, "cancelled", 100)
+        return JSONResponse({"status": "cancelled"}, status_code=200)
     if not outcome.ok:
         if outcome.status_code == 0:
             logger.error("upload failed (session=%s item=%s): %s", session_id, item_id, outcome.error)
@@ -833,25 +804,49 @@ async def process_upload(
 
     asset_id = outcome.asset_id
     status = outcome.status or "created"
-    db_insert_upload(checksum, orig_name, size, device_asset_id, asset_id, created_iso)
+    db_insert_upload(checksum, orig_name, size, device_asset_id, asset_id, created_iso, owner)
 
     # Add to album if configured (invite overrides .env)
     if asset_id:
         if invite_token:
             # Only add if invite specified an album; do not fallback to env default
             if target_album_id or target_album_name:
-                if await add_asset_to_album(asset_id, request=request, album_id_override=target_album_id, album_name_override=target_album_name, headers_override=(upload_headers if share_key else None)):
+                if await add_asset_to_album(asset_id, request=request, album_id_override=target_album_id, album_name_override=target_album_name, headers_override=upload_headers, owner=owner):
                     status += f" (added to album '{target_album_name or target_album_id}')"
-        elif SETTINGS.album_name:
-            if await add_asset_to_album(asset_id, request=request):
-                status += f" (added to album '{SETTINGS.album_name}')"
+        elif album_name or SETTINGS.album_name:
+            # Logged-in uploads: album chosen on the upload page, else the .env default
+            target = (album_name or "").strip() or SETTINGS.album_name
+            if await add_asset_to_album(asset_id, request=request, album_name_override=target, headers_override=upload_headers, owner=owner):
+                status += f" (added to album '{target}')"
 
     await send_progress(session_id, item_id, "duplicate" if outcome.status == "duplicate" else "done", 100, status, asset_id)
 
-    if invite_token and not share_key:
+    if invite_token:
         increment_invite_usage(invite_token)
     log_upload_event(request, invite_token, fingerprint, orig_name, size, checksum, asset_id)
     return JSONResponse({"id": asset_id, "status": status}, status_code=200)
+
+@app.post("/api/upload/cancel")
+async def api_upload_cancel(request: Request) -> JSONResponse:
+    """Abort an upload that is still queued, being received, or being forwarded to Immich."""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    session_id = str((data or {}).get("session_id") or "")
+    item_id = str((data or {}).get("item_id") or "")
+    if not session_id or not item_id:
+        return JSONResponse({"error": "missing_ids"}, status_code=400)
+    if denied := _upload_not_allowed(request, (data or {}).get("invite_token")):
+        return denied
+    now = time.time()
+    for key in [k for k, t in _CANCELLED.items() if now - t > 3600]:
+        _CANCELLED.pop(key, None)  # flags of items that finished long ago
+    _CANCELLED[(session_id, item_id)] = now
+    # partly received chunks are of no use any more
+    with suppress(Exception):
+        shutil.rmtree(_chunk_dir(session_id, item_id), ignore_errors=True)
+    return JSONResponse({"ok": True})
 
 @app.post("/api/upload")
 async def api_upload(
@@ -862,8 +857,11 @@ async def api_upload(
     last_modified: Optional[int] = Form(None),
     invite_token: Optional[str] = Form(None),
     fingerprint: Optional[str] = Form(None),
+    album_name: Optional[str] = Form(None),
 ):
     """Receive a file, check duplicates, forward to Immich; stream progress via WS."""
+    if denied := _upload_not_allowed(request, invite_token):
+        return denied
     raw = await file.read()
     return await process_upload(
         request,
@@ -875,6 +873,7 @@ async def api_upload(
         last_modified=last_modified,
         invite_token=invite_token,
         fingerprint=fingerprint,
+        album_name=album_name,
     )
 
 # --------- Chunked upload endpoints ---------
@@ -896,16 +895,23 @@ def _chunk_dir(session_id: str, item_id: str) -> str:
     return path
 
 
+def _upload_not_allowed(request: Request, invite_token: Optional[str]) -> Optional[JSONResponse]:
+    """Uploads need an invite token or a logged-in session; never the bare server API key."""
+    if invite_token or request.session.get("accessToken"):
+        return None
+    return JSONResponse({"error": "login_required"}, status_code=401)
+
+
 async def _guard_chunked_upload(request: Request, invite_token: Optional[str]) -> Optional[JSONResponse]:
     """Reject chunk writes before any bytes hit disk.
 
-    Read-only: one-time invites are still claimed at completion. A token that
-    is not a local invite is validated against Immich as a Shared Link key
-    here rather than at completion, so an unrecognized token still cannot
-    write parts to /data.
+    Read-only: one-time invites are still claimed at completion. An unknown
+    token is rejected here, so it cannot write parts to /data.
     """
     if not SETTINGS.chunked_uploads_enabled:
         return JSONResponse({"error": "chunked_uploads_disabled"}, status_code=403)
+    if denied := _upload_not_allowed(request, invite_token):
+        return denied
     if not invite_token:
         return None
     try:
@@ -921,13 +927,7 @@ async def _guard_chunked_upload(request: Request, invite_token: Optional[str]) -
         logger.exception("Invite precheck failed: %s", e)
         return JSONResponse({"error": "invite_lookup_failed"}, status_code=500)
     if not row:
-        # Not a local invite. Validate it as an Immich Shared Link key now;
-        # returning None here would let any token write parts to disk.
-        error, _album_id, _album_name, _share_key = await check_immich_share_for_upload(request, invite_token)
-        if error:
-            _msg, error_key, http_status = error
-            return JSONResponse({"error": error_key}, status_code=http_status)
-        return None
+        return JSONResponse({"error": "invalid_invite"}, status_code=403)
     expires_at, disabled, max_uses, used_count = row
     if int(disabled or 0) == 1:
         return JSONResponse({"error": "invite_disabled"}, status_code=403)
@@ -1051,6 +1051,7 @@ async def api_upload_chunk_complete(request: Request) -> JSONResponse:
     last_modified = (data or {}).get("last_modified")
     invite_token = (data or {}).get("invite_token")
     fingerprint = (data or {}).get("fingerprint")
+    album_name = (data or {}).get("album_name")
     content_type = (data or {}).get("content_type") or "application/octet-stream"
     if not item_id or not session_id:
         return JSONResponse({"error": "missing_ids"}, status_code=400)
@@ -1110,6 +1111,7 @@ async def api_upload_chunk_complete(request: Request) -> JSONResponse:
         last_modified=last_modified,
         invite_token=invite_token,
         fingerprint=fingerprint,
+        album_name=album_name,
     )
 
 @app.post("/api/album/reset")
@@ -1120,9 +1122,51 @@ async def api_album_reset() -> dict:
 
 # ---------- Auth & Albums & Invites APIs ----------
 
+_AUTH_OPTIONS_TTL = 60.0
+_auth_options_cache: dict = {"at": 0.0, "value": None}
+
+async def _fetch_auth_options() -> dict:
+    """Ask Immich which login methods are enabled (cached briefly)."""
+    now = time.monotonic()
+    cached = _auth_options_cache["value"]
+    if cached is not None and now - _auth_options_cache["at"] < _AUTH_OPTIONS_TTL:
+        return cached
+    opts = {"password": True, "oauth": False, "autoLaunch": False, "oauthButtonText": None, "message": None}
+    base = SETTINGS.normalized_base_url
+    headers = {"Accept": "application/json"}
+    client = app.state.httpx_client
+    try:
+        rf = await client.get(f"{base}/server/features", headers=headers, timeout=10.0)
+        rf.raise_for_status()
+        f = rf.json()
+        opts["password"] = bool(f.get("passwordLogin", True))
+        opts["oauth"] = bool(f.get("oauth", False))
+        opts["autoLaunch"] = bool(f.get("oauthAutoLaunch", False)) and opts["oauth"]
+        try:
+            rc = await client.get(f"{base}/server/config", headers=headers, timeout=10.0)
+            if rc.is_success:
+                c = rc.json()
+                opts["oauthButtonText"] = c.get("oauthButtonText") or None
+                opts["message"] = c.get("loginPageMessage") or None
+        except Exception:
+            logger.debug("Fetching /server/config failed", exc_info=True)
+    except Exception as e:
+        # Immich unreachable: keep the safe default (password only) and don't cache it.
+        logger.warning("Could not fetch Immich login options: %s", e)
+        return opts
+    _auth_options_cache.update({"at": now, "value": opts})
+    return opts
+
+@app.get("/api/auth/options")
+async def api_auth_options() -> dict:
+    """Public: which login methods Immich currently offers."""
+    return await _fetch_auth_options()
+
 @app.post("/api/login")
 async def api_login(request: Request) -> JSONResponse:
     """Authenticate against Immich using email/password; store token in session."""
+    if not (await _fetch_auth_options())["password"]:
+        return JSONResponse({"error": "password_login_disabled"}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -1132,9 +1176,10 @@ async def api_login(request: Request) -> JSONResponse:
     if not email or not password:
         return JSONResponse({"error": "missing_credentials"}, status_code=400)
     try:
-        # Use shared httpx client from app state
-        client = app.state.httpx_client
-        r = await client.post(f"{SETTINGS.normalized_base_url}/auth/login", headers={"Content-Type": "application/json", "Accept": "application/json"}, json={"email": email, "password": password}, timeout=15.0)
+        # Throwaway client: httpx keeps response cookies on the client that made the request, and the shared
+        # client must never carry a user's Immich session cookie into later requests (e.g. API key checks).
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(f"{SETTINGS.normalized_base_url}/auth/login", headers={"Content-Type": "application/json", "Accept": "application/json"}, json={"email": email, "password": password}, timeout=15.0)
     except Exception as e:
         logger.exception("Login request failed: %s", e)
         return JSONResponse({"error": "login_failed"}, status_code=502)
@@ -1164,6 +1209,8 @@ def _oauth_redirect_uri(request: Request) -> str:
 @app.get("/oauth/start")
 async def oauth_start(request: Request) -> RedirectResponse:
     """Begin Immich OAuth/OIDC login (PKCE); redirects the browser to the identity provider."""
+    if not (await _fetch_auth_options())["oauth"]:
+        return RedirectResponse(url=_u("/login?error=oauth_disabled"))
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     state = secrets.token_urlsafe(32)
@@ -1177,11 +1224,11 @@ async def oauth_start(request: Request) -> RedirectResponse:
             )
     except Exception as e:
         logger.exception("OAuth authorize request failed: %s", e)
-        return RedirectResponse(url="/login?error=oauth_failed")
+        return RedirectResponse(url=_u("/login?error=oauth_failed"))
     url = r.json().get("url") if r.status_code in (200, 201) and r.content else None
     if not url:
         logger.warning("OAuth authorize rejected: %s - %s", r.status_code, r.text)
-        return RedirectResponse(url="/login?error=oauth_failed")
+        return RedirectResponse(url=_u("/login?error=oauth_failed"))
     request.session["oauth"] = {"state": state, "verifier": verifier}
     return RedirectResponse(url=url)
 
@@ -1192,7 +1239,7 @@ async def oauth_callback(request: Request) -> RedirectResponse:
     received_state = request.query_params.get("state")
     if not pending or not received_state or not secrets.compare_digest(received_state, pending["state"]):
         logger.warning("OAuth callback with missing or mismatched state")
-        return RedirectResponse(url="/login?error=oauth_failed")
+        return RedirectResponse(url=_u("/login?error=oauth_failed"))
     # Behind a proxy the request scheme/host may differ; rebuild from the registered redirect URI.
     callback_url = f"{_oauth_redirect_uri(request)}?{request.url.query}"
     try:
@@ -1204,12 +1251,12 @@ async def oauth_callback(request: Request) -> RedirectResponse:
             )
     except Exception as e:
         logger.exception("OAuth callback request failed: %s", e)
-        return RedirectResponse(url="/login?error=oauth_failed")
+        return RedirectResponse(url=_u("/login?error=oauth_failed"))
     data = r.json() if r.content else {}
     token = data.get("accessToken") if r.status_code in (200, 201) else None
     if not token:
         logger.warning("OAuth login rejected: %s - %s", r.status_code, r.text)
-        return RedirectResponse(url="/login?error=oauth_failed")
+        return RedirectResponse(url=_u("/login?error=oauth_failed"))
     request.session.update({
         "accessToken": token,
         "userEmail": data.get("userEmail"),
@@ -1218,7 +1265,7 @@ async def oauth_callback(request: Request) -> RedirectResponse:
         "isAdmin": data.get("isAdmin", False),
     })
     logger.info("User %s logged in via OAuth", data.get("userEmail"))
-    return RedirectResponse(url="/menu")
+    return RedirectResponse(url=_u("/"))
 
 @app.post("/api/logout")
 async def api_logout(request: Request) -> dict:
@@ -1228,11 +1275,130 @@ async def api_logout(request: Request) -> dict:
 @app.get("/logout")
 async def logout_get(request: Request) -> RedirectResponse:
     request.session.clear()
-    return RedirectResponse(url="/login")
+    return RedirectResponse(url=_u("/login"))
+
+@app.get("/api/me/key")
+async def api_my_key(request: Request) -> JSONResponse:
+    """State of the key in use: own (saved by the user), server (IMMICH_API_KEY), and its status: ok, missing, invalid, unknown."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    own = stored_api_key(str(request.session.get("userId") or ""))
+    key = SETTINGS.immich_api_key or own
+    status = "missing"
+    if key:
+        status = "ok"
+        try:
+            r = await app.state.httpx_client.get(f"{SETTINGS.normalized_base_url}/users/me", headers={"Accept": "application/json", "x-api-key": key}, timeout=10.0)
+            if r.status_code == 401:
+                status = "invalid"
+        except Exception:
+            status = "unknown"
+    return JSONResponse({"own": bool(own), "server": bool(SETTINGS.immich_api_key), "status": status, "immichUrl": SETTINGS.immich_web_url})
+
+@app.put("/api/me/key")
+async def api_my_key_set(request: Request) -> JSONResponse:
+    """Save the user's own Immich API key; it must belong to the account that is logged in."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if SETTINGS.immich_api_key:
+        return JSONResponse({"error": "key_managed_by_env"}, status_code=409)
+    key = str((body or {}).get("apiKey") or "").strip()
+    if not key:
+        return JSONResponse({"error": "missing_key"}, status_code=400)
+    user_id = str(request.session.get("userId") or "")
+    # GET /users/me needs the user.read permission; it tells whose key this is
+    try:
+        r = await app.state.httpx_client.get(f"{SETTINGS.normalized_base_url}/users/me", headers={"Accept": "application/json", "x-api-key": key}, timeout=10.0)
+    except Exception as e:
+        logger.exception("API key check failed: %s", e)
+        return JSONResponse({"error": "request_failed"}, status_code=502)
+    if r.status_code == 403:
+        return JSONResponse({"error": "key_missing_permission"}, status_code=400)
+    if r.status_code == 401:
+        return JSONResponse({"error": "key_invalid"}, status_code=400)
+    if r.status_code != 200:
+        logger.warning("API key check: Immich answered %s - %s", r.status_code, r.text[:200])
+        return JSONResponse({"error": "immich_error", "status": r.status_code}, status_code=502)
+    if str(r.json().get("id") or "") != user_id:
+        return JSONResponse({"error": "key_other_account"}, status_code=400)
+    conn = db.connect()
+    conn.execute(
+        "INSERT INTO user_keys (user_id, api_key) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET api_key = excluded.api_key, updated_at = CURRENT_TIMESTAMP",
+        (user_id, key),
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True})
+
+@app.delete("/api/me/key")
+async def api_my_key_delete(request: Request) -> JSONResponse:
+    """Remove the user's saved API key."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    conn = db.connect()
+    conn.execute("DELETE FROM user_keys WHERE user_id = ?", (str(request.session.get("userId") or ""),))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True})
+
+@app.get("/api/me/shortcut")
+async def api_my_shortcut(request: Request) -> JSONResponse:
+    """Whether the iOS Shortcut is enabled on the server, and whether the user has a token."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    conn = db.connect()
+    row = conn.execute("SELECT 1 FROM shortcut_tokens WHERE user_id = ?", (str(request.session.get("userId") or ""),)).fetchone()
+    conn.close()
+    return JSONResponse({"enabled": SETTINGS.shortcut_enabled, "exists": bool(row)})
+
+SHORTCUT_FILE = os.path.join(os.path.dirname(__file__), "assets", "Immich-Drop.shortcut")
+
+@app.get("/api/me/shortcut/file")
+async def api_my_shortcut_file(request: Request) -> Response:
+    """Download the pre-built iOS Shortcut (contains no server URL or token)."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not SETTINGS.shortcut_enabled:
+        return JSONResponse({"error": "shortcut_disabled"}, status_code=404)
+    return FileResponse(SHORTCUT_FILE, media_type="application/octet-stream", filename="Immich-Drop.shortcut")
+
+@app.post("/api/me/shortcut")
+async def api_my_shortcut_create(request: Request) -> JSONResponse:
+    """Create (or replace) the user's shortcut token. It is shown once; only a hash is stored."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not SETTINGS.shortcut_enabled:
+        return JSONResponse({"error": "shortcut_disabled"}, status_code=404)
+    token = secrets.token_urlsafe(32)
+    conn = db.connect()
+    conn.execute(
+        "INSERT INTO shortcut_tokens (user_id, token_hash) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET token_hash = excluded.token_hash, created_at = CURRENT_TIMESTAMP",
+        (str(request.session.get("userId") or ""), hashlib.sha256(token.encode("utf-8")).hexdigest()),
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse({"token": token})
+
+@app.delete("/api/me/shortcut")
+async def api_my_shortcut_delete(request: Request) -> JSONResponse:
+    """Revoke the user's shortcut token."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    conn = db.connect()
+    conn.execute("DELETE FROM shortcut_tokens WHERE user_id = ?", (str(request.session.get("userId") or ""),))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True})
 
 @app.get("/api/albums")
 async def api_albums(request: Request) -> JSONResponse:
     """Return list of albums if authorized; logs on 401/403."""
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         # Use shared httpx client from app state
         client = app.state.httpx_client
@@ -1249,6 +1415,8 @@ async def api_albums(request: Request) -> JSONResponse:
 
 @app.post("/api/albums")
 async def api_albums_create(request: Request) -> JSONResponse:
+    if not request.session.get("accessToken"):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -1297,6 +1465,46 @@ def verify_password(stored: str, pw: Optional[str]) -> bool:
     except Exception:
         return False
 
+MAX_INVITE_USES = 1_000_000
+MAX_EXPIRY_DAYS = 3650
+
+def _parse_int(value) -> Optional[int]:
+    """Whole number from an int or numeric string; None for anything else (bools, floats, text)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d{1,9}", value.strip()):
+        return int(value.strip())
+    return None
+
+def _valid_max_uses(value) -> Optional[int]:
+    """-1 (unlimited) or 1..MAX_INVITE_USES; None if the value makes no sense."""
+    n = _parse_int(value)
+    if n is None or n == 0 or n < -1 or n > MAX_INVITE_USES:
+        return None
+    return n
+
+def _expiry_from_days(value) -> Optional[str]:
+    """Expiry timestamp for 1..MAX_EXPIRY_DAYS days from now; None if the value makes no sense."""
+    n = _parse_int(value)
+    if n is None or n < 1 or n > MAX_EXPIRY_DAYS:
+        return None
+    return (datetime.utcnow() + timedelta(days=n)).replace(microsecond=0).isoformat()
+
+def _valid_expires_at(value) -> Optional[str]:
+    """The ISO timestamp as UTC without timezone, if it is in the future and within MAX_EXPIRY_DAYS."""
+    try:
+        dt = datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    now = datetime.utcnow()
+    if dt <= now or dt > now + timedelta(days=MAX_EXPIRY_DAYS):
+        return None
+    return dt.replace(microsecond=0).isoformat()
+
 @app.post("/api/invites")
 async def api_invites_create(request: Request) -> JSONResponse:
     """Create an invite link for uploads with optional expiry and max uses."""
@@ -1307,16 +1515,21 @@ async def api_invites_create(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if key_headers(str(request.session.get("userId") or ""))[0] is None:
+        return JSONResponse({"error": "no_api_key"}, status_code=409)
     album_id = (body or {}).get("albumId")
     album_name = (body or {}).get("albumName")
-    max_uses = (body or {}).get("maxUses", 1)
+    max_uses = _valid_max_uses((body or {}).get("maxUses", 1))
+    if max_uses is None:
+        return JSONResponse({"error": "invalid_max_uses"}, status_code=400)
     invite_password = (body or {}).get("password")
     expires_days = (body or {}).get("expiresDays")
-    # Normalize max_uses
-    try:
-        max_uses = int(max_uses)
-    except Exception:
-        max_uses = 1
+    link_name_in = str((body or {}).get("name") or "").strip()[:120]
+    expires_at = None
+    if expires_days not in (None, ""):
+        expires_at = _expiry_from_days(expires_days)
+        if expires_at is None:
+            return JSONResponse({"error": "invalid_expiry"}, status_code=400)
     # Allow blank album for invites (no album association)
     if not album_name and SETTINGS.album_name and not album_id and album_name is not None:
         album_name = SETTINGS.album_name
@@ -1326,14 +1539,6 @@ async def api_invites_create(request: Request) -> JSONResponse:
         resolved_album_id = await get_or_create_album(request=request, album_name_override=album_name)
     else:
         resolved_album_id = album_id
-    # Compute expiry
-    expires_at = None
-    if expires_days is not None:
-        try:
-            days = int(expires_days)
-            expires_at = (datetime.utcnow() + timedelta(days=days)).replace(microsecond=0).isoformat()
-        except Exception:
-            expires_at = None
     # Generate token
     import uuid
     token = uuid.uuid4().hex
@@ -1344,8 +1549,8 @@ async def api_invites_create(request: Request) -> JSONResponse:
     owner_name = str(request.session.get("name") or "")
     # Friendly name: default to album + creation timestamp if not provided in future updates
     # Here we set a default immediately
-    now_tag = datetime.utcnow().strftime("%Y%m%d-%H%M")
-    default_link_name = f"{album_name or 'NoAlbum'}-{now_tag}"
+    now_tag = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    default_link_name = link_name_in or f"{album_name or 'Link'} {now_tag}"
     try:
         conn = db.connect()
         cur = conn.cursor()
@@ -1411,7 +1616,7 @@ async def api_invites_list(request: Request) -> JSONResponse:
             like = f"%{q}%"
             cur.execute(
                 """
-                SELECT token, name, album_id, album_name, max_uses, used_count, expires_at, COALESCE(claimed,0), COALESCE(disabled,0), created_at
+                SELECT token, name, album_id, album_name, max_uses, used_count, expires_at, COALESCE(claimed,0), COALESCE(disabled,0), created_at, (COALESCE(password_hash,'') != '')
                 FROM invites
                 WHERE owner_user_id = ? AND (
                     COALESCE(name,'') LIKE ? OR COALESCE(album_name,'') LIKE ? OR token LIKE ?
@@ -1421,7 +1626,7 @@ async def api_invites_list(request: Request) -> JSONResponse:
             )
         else:
             cur.execute(
-                f"SELECT token, name, album_id, album_name, max_uses, used_count, expires_at, COALESCE(claimed,0), COALESCE(disabled,0), created_at FROM invites WHERE owner_user_id = ? ORDER BY {sort_sql}",
+                f"SELECT token, name, album_id, album_name, max_uses, used_count, expires_at, COALESCE(claimed,0), COALESCE(disabled,0), created_at, (COALESCE(password_hash,'') != '') FROM invites WHERE owner_user_id = ? ORDER BY {sort_sql}",
                 (owner_user_id,)
             )
         rows = cur.fetchall()
@@ -1431,7 +1636,7 @@ async def api_invites_list(request: Request) -> JSONResponse:
         return JSONResponse({"error": "db_error"}, status_code=500)
     items = []
     now = datetime.utcnow()
-    for (token, name, album_id, album_name, max_uses, used_count, expires_at, claimed, disabled, created_at) in rows:
+    for (token, name, album_id, album_name, max_uses, used_count, expires_at, claimed, disabled, created_at, has_password) in rows:
         try:
             max_uses_int = int(max_uses) if max_uses is not None else -1
         except Exception:
@@ -1474,6 +1679,7 @@ async def api_invites_list(request: Request) -> JSONResponse:
             "active": active,
             "inactiveReason": inactive_reason,
             "createdAt": created_at,
+            "passwordRequired": bool(has_password),
         })
     return JSONResponse({"items": items})
 
@@ -1493,7 +1699,7 @@ async def api_invite_update(token: str, request: Request) -> JSONResponse:
     # Name
     if "name" in (body or {}):
         fields.append("name = ?")
-        params.append(str((body or {}).get("name") or "").strip())
+        params.append(str((body or {}).get("name") or "").strip()[:120])
     # Disabled toggle
     if "disabled" in (body or {}):
         try:
@@ -1504,27 +1710,22 @@ async def api_invite_update(token: str, request: Request) -> JSONResponse:
         params.append(disabled)
     # Max uses
     if "maxUses" in (body or {}):
-        try:
-            mu = int((body or {}).get("maxUses"))
-        except Exception:
-            mu = 1
+        mu = _valid_max_uses((body or {}).get("maxUses"))
+        if mu is None:
+            return JSONResponse({"error": "invalid_max_uses"}, status_code=400)
         fields.append("max_uses = ?")
         params.append(mu)
     # Expiration
     if "expiresAt" in (body or {}) or "expiresDays" in (body or {}):
         expires_at = None
         if (body or {}).get("expiresAt"):
-            try:
-                # trust provided ISO string
-                expires_at = str((body or {}).get("expiresAt"))
-            except Exception:
-                expires_at = None
-        else:
-            try:
-                days = int((body or {}).get("expiresDays"))
-                expires_at = (datetime.utcnow() + timedelta(days=days)).replace(microsecond=0).isoformat()
-            except Exception:
-                expires_at = None
+            expires_at = _valid_expires_at((body or {}).get("expiresAt"))
+            if expires_at is None:
+                return JSONResponse({"error": "invalid_expiry"}, status_code=400)
+        elif (body or {}).get("expiresDays") not in (None, ""):
+            expires_at = _expiry_from_days((body or {}).get("expiresDays"))
+            if expires_at is None:
+                return JSONResponse({"error": "invalid_expiry"}, status_code=400)
         fields.append("expires_at = ?")
         params.append(expires_at)
     # Password
@@ -1538,13 +1739,14 @@ async def api_invite_update(token: str, request: Request) -> JSONResponse:
     # Reset usage
     reset_usage = bool((body or {}).get("resetUsage"))
     try:
-        if fields:
+        if fields or reset_usage:
             conn = db.connect()
             cur = conn.cursor()
-            cur.execute(
-                f"UPDATE invites SET {', '.join(fields)} WHERE token = ? AND owner_user_id = ?",
-                (*params, token, owner_user_id)
-            )
+            if fields:
+                cur.execute(
+                    f"UPDATE invites SET {', '.join(fields)} WHERE token = ? AND owner_user_id = ?",
+                    (*params, token, owner_user_id)
+                )
             if reset_usage:
                 cur.execute("UPDATE invites SET used_count = 0, claimed = 0, claimed_at = NULL, claimed_by_session = NULL WHERE token = ? AND owner_user_id = ?", (token, owner_user_id))
             conn.commit()
@@ -1666,7 +1868,7 @@ async def api_invite_uploads(token: str, request: Request) -> JSONResponse:
 
 @app.get("/invite/{token}", response_class=HTMLResponse)
 async def invite_page(token: str, request: Request) -> HTMLResponse:
-    return FileResponse(os.path.join(FRONTEND_DIR, "invite.html"))
+    return _spa()
 
 @app.get("/api/invite/{token}")
 async def api_invite_info(token: str, request: Request) -> JSONResponse:
@@ -1680,7 +1882,7 @@ async def api_invite_info(token: str, request: Request) -> JSONResponse:
         logger.exception("Invite info error: %s", e)
         return JSONResponse({"error": "db_error"}, status_code=500)
     if not row:
-        return await immich_share_info(token, request)
+        return JSONResponse({"error": "not_found"}, status_code=404)
     _, album_id, album_name, max_uses, used_count, expires_at, claimed, claimed_at, password_hash, disabled, link_name = row
     
     # If we have an album_id but no album_name, try to fetch it from Immich
@@ -1780,7 +1982,7 @@ async def api_invite_auth(token: str, request: Request) -> JSONResponse:
         logger.exception("Invite auth lookup error: %s", e)
         return JSONResponse({"error": "db_error"}, status_code=500)
     if not row:
-        return await immich_share_auth(token, request, provided)
+        return JSONResponse({"error": "not_found"}, status_code=404)
     password_hash = row[0]
     if not password_hash:
         # No password required; mark as authorized to simplify client flow
@@ -1823,10 +2025,10 @@ from .cookie_manager import (
 
 @app.get("/api/cookies")
 async def api_cookies_list(request: Request) -> JSONResponse:
-    """List all configured platform cookies. Requires admin login."""
+    """List the logged-in user's platform cookies."""
     if not request.session.get("accessToken"):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    cookies = db_list_cookies(SETTINGS.state_db)
+    cookies = db_list_cookies(SETTINGS.state_db, str(request.session.get("userId") or ""))
     # Mask cookie values for security (show only first 40 chars)
     for c in cookies:
         if c.get("cookie_string") and len(c["cookie_string"]) > 40:
@@ -1838,7 +2040,7 @@ async def api_cookies_list(request: Request) -> JSONResponse:
 
 @app.post("/api/cookies")
 async def api_cookies_upsert(request: Request) -> JSONResponse:
-    """Create or update a platform cookie. Requires admin login."""
+    """Create or update a platform cookie of the logged-in user."""
     if not request.session.get("accessToken"):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
@@ -1853,18 +2055,18 @@ async def api_cookies_upsert(request: Request) -> JSONResponse:
         return JSONResponse({"error": "missing_cookie_string"}, status_code=400)
     if platform not in PLATFORM_DOMAINS:
         return JSONResponse({"error": "unsupported_platform", "supported": list(PLATFORM_DOMAINS.keys())}, status_code=400)
-    success = db_upsert_cookie(SETTINGS.state_db, platform, cookie_string)
+    success = db_upsert_cookie(SETTINGS.state_db, platform, cookie_string, str(request.session.get("userId") or ""))
     if success:
         return JSONResponse({"ok": True, "platform": platform})
     return JSONResponse({"error": "save_failed"}, status_code=500)
 
 @app.delete("/api/cookies/{platform}")
 async def api_cookies_delete(request: Request, platform: str) -> JSONResponse:
-    """Delete a platform cookie. Requires admin login."""
+    """Delete a platform cookie of the logged-in user."""
     if not request.session.get("accessToken"):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     platform = platform.strip().lower()
-    deleted = db_delete_cookie(SETTINGS.state_db, platform)
+    deleted = db_delete_cookie(SETTINGS.state_db, platform, str(request.session.get("userId") or ""))
     if deleted:
         return JSONResponse({"ok": True, "deleted": platform})
     return JSONResponse({"error": "not_found"}, status_code=404)

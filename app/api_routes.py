@@ -1,20 +1,20 @@
 """
 API Routes for immich-drop extensions
 - URL download and upload to Immich
-- Batch upload for iOS Shortcuts
+- Optional batch/file/base64 upload for iOS Shortcuts (SHORTCUT_ENABLED)
 """
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime, timezone
+import asyncio
+import base64
 import hashlib
 import httpx
-import os
-import base64
 import logging
 import mimetypes
-import asyncio
+import os
 
 logger = logging.getLogger("immich_drop.api_routes")
 
@@ -27,12 +27,10 @@ from .url_downloader import (
     is_direct_image_url,
     SUPPORTED_PATTERNS,
 )
+from . import db
 from .cookie_manager import get_cookie_file_for_platform
-from .utils import detect_file_type
 from .job_manager import create_job, get_job, update_job
-
-
-router = APIRouter(prefix="/api", tags=["api"])
+from .utils import detect_file_type
 
 
 # ============================================================================
@@ -111,10 +109,11 @@ async def upload_to_immich(
     config,  # Config object from main app
     httpx_client: httpx.AsyncClient,  # Shared httpx client
     file_created_at: Optional[datetime] = None,
+    api_key: Optional[str] = None,  # defaults to the server key
 ) -> UploadResult:
     """Upload a file to Immich server"""
     sha1 = hashlib.sha1(file_content).hexdigest()
-    headers = {"x-api-key": config.immich_api_key}
+    headers = {"x-api-key": api_key or config.immich_api_key}
     outcome = await immich_client.upload_asset(
         httpx_client,
         config.normalized_base_url,
@@ -146,9 +145,10 @@ async def add_asset_to_album(
     album_name: str,
     config,
     httpx_client: httpx.AsyncClient,  # Shared httpx client
+    api_key: Optional[str] = None,  # defaults to the server key
 ) -> bool:
     """Add an asset to an album (creates album if needed)"""
-    headers = {"x-api-key": config.immich_api_key}
+    headers = {"x-api-key": api_key or config.immich_api_key}
     album_id = await immich_client.find_or_create_album(
         httpx_client, config.normalized_base_url, headers, album_name
     )
@@ -163,8 +163,43 @@ async def add_asset_to_album(
 # API Endpoints
 # ============================================================================
 
-def create_api_routes(config):
+def create_api_routes(config, key_for_user=lambda user_id: None):
     """Factory function to create routes with config injection"""
+
+    def require_access(request: Request) -> None:
+        """Logged-in session, or (only when SHORTCUT_ENABLED is set) a user's shortcut token.
+
+        These routes run with Immich credentials, so they are never anonymous. The user is kept in request.state.
+        """
+        if request.session.get("accessToken"):
+            request.state.user_id = str(request.session.get("userId") or "")
+            return
+        if config.shortcut_enabled:
+            auth = request.headers.get("authorization", "")
+            supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+            if supplied:
+                conn = db.connect()
+                row = conn.execute(
+                    "SELECT user_id FROM shortcut_tokens WHERE token_hash = ?",
+                    (hashlib.sha256(supplied.encode("utf-8")).hexdigest(),),
+                ).fetchone()
+                conn.close()
+                if row:
+                    request.state.user_id = row[0]
+                    return
+        raise HTTPException(status_code=401, detail="Login required")
+
+    def key_and_user(request: Request) -> tuple[str, str]:
+        """The caller's API key and user id (cookies are per user); 409 if there is no key."""
+        user_id = request.state.user_id
+        api_key = key_for_user(user_id)
+        if not api_key:
+            raise HTTPException(status_code=409, detail="no_api_key")
+        return api_key, user_id
+
+    router = APIRouter(prefix="/api", tags=["api"], dependencies=[Depends(require_access)])
+    # Batch/file/base64 endpoints for the iOS Shortcut and scripts; only mounted when enabled.
+    shortcut_router = APIRouter(tags=["shortcut"])
 
     @router.get("/supported-platforms", response_model=SupportedPlatformsResponse)
     async def get_supported_platforms():
@@ -191,6 +226,9 @@ def create_api_routes(config):
         Start async download from a supported URL.
         Returns a job ID immediately. Poll /api/upload/url/status/{job_id} for results.
         """
+        if not config.social_media_uploads:
+            raise HTTPException(status_code=403, detail="Downloads from platforms are disabled")
+        api_key, user_id = key_and_user(request)
         url = url_request.url.strip()
         if not url:
             raise HTTPException(status_code=400, detail="URL is required")
@@ -205,7 +243,7 @@ def create_api_routes(config):
         job = create_job(url, url_request.album_name)
         httpx_client = request.app.state.httpx_client
 
-        asyncio.create_task(_process_url_job(job.id, url, url_request.album_name, platform, httpx_client))
+        asyncio.create_task(_process_url_job(job.id, url, url_request.album_name, platform, httpx_client, api_key, user_id))
 
         return JobResponse(job_id=job.id, status=job.status)
 
@@ -215,12 +253,14 @@ def create_api_routes(config):
         album_name: Optional[str],
         platform: Optional[str],
         httpx_client,
+        api_key: Optional[str] = None,
+        user_id: str = "",
     ):
         """Background task: download media from URL and upload to Immich."""
         try:
             update_job(job_id, status="downloading")
 
-            cookies_file = get_cookie_file_for_platform(platform, config.state_db) if platform else None
+            cookies_file = get_cookie_file_for_platform(platform, config.state_db, user_id) if platform else None
             download_results = await download_from_url_multi(url, cookies_file=cookies_file, settings=config)
 
             successful_downloads = [r for r in download_results if r.success]
@@ -262,12 +302,13 @@ def create_api_routes(config):
                         config=config,
                         httpx_client=httpx_client,
                         file_created_at=file_created_at,
+                        api_key=api_key,
                     )
                     upload_result.platform = source_label
 
-                    target_album = album_name or getattr(config, 'album_name', None)
+                    target_album = album_name if album_name is not None else getattr(config, 'album_name', None)
                     if target_album and upload_result.asset_id and upload_result.status == "success":
-                        await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client)
+                        await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
 
                     if upload_result.status == "success":
                         total_uploaded += 1
@@ -317,7 +358,7 @@ def create_api_routes(config):
             resp["error"] = job.error or "Unknown error"
         return JSONResponse(resp)
 
-    @router.post("/upload/urls", response_model=BatchUploadResponse)
+    @shortcut_router.post("/upload/urls", response_model=BatchUploadResponse)
     async def upload_from_urls(
         batch_request: UrlBatchUploadRequest,
         background_tasks: BackgroundTasks,
@@ -328,6 +369,9 @@ def create_api_routes(config):
 
         Max 10 URLs per request
         """
+        if not config.social_media_uploads:
+            raise HTTPException(status_code=403, detail="Downloads from platforms are disabled")
+        api_key, user_id = key_and_user(request)
         urls = [u.strip() for u in batch_request.urls if u.strip()]
         httpx_client = request.app.state.httpx_client
 
@@ -345,7 +389,7 @@ def create_api_routes(config):
         cookies_file = None
         unique_platforms = set(p for p in platforms if p is not None)
         if len(unique_platforms) == 1:
-            cookies_file = get_cookie_file_for_platform(list(unique_platforms)[0], config.state_db)
+            cookies_file = get_cookie_file_for_platform(list(unique_platforms)[0], config.state_db, user_id)
 
         results = []
         download_results = await download_multiple_urls(urls, cookies_file=cookies_file, settings=config)
@@ -382,13 +426,14 @@ def create_api_routes(config):
                     config=config,
                     httpx_client=httpx_client,
                     file_created_at=file_created_at,
+                    api_key=api_key,
                 )
                 upload_result.platform = source_label
 
                 # Add to album
-                album_name = batch_request.album_name or getattr(config, 'album_name', None)
+                album_name = batch_request.album_name if batch_request.album_name is not None else getattr(config, 'album_name', None)
                 if album_name and upload_result.asset_id and upload_result.status == "success":
-                    await add_asset_to_album(upload_result.asset_id, album_name, config, httpx_client)
+                    await add_asset_to_album(upload_result.asset_id, album_name, config, httpx_client, api_key)
 
                 results.append(upload_result)
 
@@ -407,7 +452,7 @@ def create_api_routes(config):
             results=results,
         )
 
-    @router.post("/upload/batch", response_model=BatchUploadResponse)
+    @shortcut_router.post("/upload/batch", response_model=BatchUploadResponse)
     async def upload_batch_files(
         request: Request,
         files: List[UploadFile] = File(...),
@@ -418,6 +463,7 @@ def create_api_routes(config):
 
         POST multipart/form-data with one or more files
         """
+        api_key, user_id = key_and_user(request)
         httpx_client = request.app.state.httpx_client
 
         if not files:
@@ -439,12 +485,13 @@ def create_api_routes(config):
                 content_type=content_type,
                 config=config,
                 httpx_client=httpx_client,
+                api_key=api_key,
                 )
 
             # Add to album
-            target_album = album_name or getattr(config, 'album_name', None)
+            target_album = album_name if album_name is not None else getattr(config, 'album_name', None)
             if target_album and upload_result.asset_id and upload_result.status == "success":
-                await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client)
+                await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
 
             results.append(upload_result)
 
@@ -460,7 +507,7 @@ def create_api_routes(config):
             results=results,
         )
 
-    @router.post("/upload/file", response_model=UploadResult)
+    @shortcut_router.post("/upload/file", response_model=UploadResult)
     async def upload_single_file(
         request: Request,
         file: UploadFile = File(...),
@@ -469,6 +516,7 @@ def create_api_routes(config):
         """
         Upload a single file - simpler endpoint for iOS Shortcuts
         """
+        api_key, user_id = key_and_user(request)
         httpx_client = request.app.state.httpx_client
         contents = await file.read()
         filename = file.filename or f"upload_{datetime.utcnow().timestamp()}"
@@ -480,15 +528,16 @@ def create_api_routes(config):
             content_type=content_type,
             config=config,
             httpx_client=httpx_client,
+            api_key=api_key,
         )
 
-        target_album = album_name or getattr(config, 'album_name', None)
+        target_album = album_name if album_name is not None else getattr(config, 'album_name', None)
         if target_album and upload_result.asset_id and upload_result.status == "success":
-            await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client)
+            await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
 
         return upload_result
 
-    @router.post("/upload/base64", response_model=UploadResult)
+    @shortcut_router.post("/upload/base64", response_model=UploadResult)
     async def upload_base64_file(
         request: Request,
         upload_request: Base64UploadRequest,
@@ -503,6 +552,7 @@ def create_api_routes(config):
             "album_name": "Album Name" (optional)
         }
         """
+        api_key, user_id = key_and_user(request)
         httpx_client = request.app.state.httpx_client
 
         # Decode base64 data
@@ -543,12 +593,16 @@ def create_api_routes(config):
             content_type=content_type,
             config=config,
             httpx_client=httpx_client,
+            api_key=api_key,
         )
 
-        target_album = upload_request.album_name or getattr(config, 'album_name', None)
+        target_album = upload_request.album_name if upload_request.album_name is not None else getattr(config, 'album_name', None)
         if target_album and upload_result.asset_id and upload_result.status == "success":
-            await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client)
+            await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
 
         return upload_result
+
+    if config.shortcut_enabled:
+        router.include_router(shortcut_router)
 
     return router

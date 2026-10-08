@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Platform cookies are saved per user; cookies saved before have no owner and are no longer used.
+- Every user saves an Immich API key of their own (asked right after the first login, changeable in the settings; a red dot on the cog shows a missing or rejected key): guest uploads through their links and their platform downloads go to their own account. The key needs `user.read` so the app can check that it belongs to the logged-in account. `IMMICH_API_KEY` is optional now; when set, it is used for everyone, saved keys are ignored and the field is locked. The local duplicate cache is kept per account. The settings link to Immich's API key page when `IMMICH_BASE_URL` is a public address.
+- OAuth/OIDC login via Immich (`/oauth/start`, `/oauth/callback`).
+- New UI built with Svelte and `@immich/ui`: `/login`, `/` (upload, files or URLs,
+  optional target album) and
+  `/invite/<token>` (guests). The old static pages are gone.
+
+### Security
+- Upload endpoints (`/api/upload`, chunk endpoints) now require an invite
+  token or a login session. Previously a request without a token was accepted
+  with the server's API key even when the public page was disabled.
+- `/api/upload/url`, its status endpoint and `/api/supported-platforms` require login.
+- `SOCIAL_MEDIA_UPLOADS_ENABLED=false` now also rejects the download endpoints; before it only hid the section in the UI.
+
+### Changed
+- The start page is a single page without tabs or navigation: "Your links" (new links are created in a dialog) and "Download from service" (last) (the former `/links` page; `/links` and `/menu` redirect to `/`). The logged-in file drop area is gone; guests keep theirs on the link page. The supported services are a tooltip above the input.
+- A settings dialog (cog icon) replaces the theme button: theme (automatic/light/dark) and language (English/German; the default follows the browser).
+- The login page adopts Immich's login settings automatically (`/api/auth/options`): password form and SSO button are shown only when enabled in Immich, with Immich's button text, login page message and SSO auto-launch.
+- Dark mode follows the browser by default and now themes the whole page.
+- Link creation is a section of the upload page (below the drop area); `/links` only manages links.
+- The connection check on the login page is a coloured dot with a tooltip.
+- The software/version line is gone from the pages.
+
+### Added (continued)
+- The iOS Shortcut and its endpoints are back as an optional feature: `SHORTCUT_ENABLED=true` turns it on, and every user generates their own token in the settings (sent as `Authorization: Bearer <token>`; only a hash is stored). The shortcut then works with the user's own API key and cookies.
+- One shared album choice (existing album or a new name; the configured default is preselected) for both "Download from service" and "Create upload link". An empty `album_name` on `/api/upload/url` and the shortcut endpoints now means "no album"; omitting it still uses `IMMICH_ALBUM_NAME`.
+
+### Added (continued)
+- The app can run under a subfolder such as `https://immich.example.com/drop`: put it into `PUBLIC_BASE_URL`; the path is taken from there. The same build works at the root and under a subfolder, and with proxies that keep or strip the prefix. The session cookie is scoped to the subfolder.
+- The name of a link can be set in the "New link" dialog; the default is now readable (album or "Link" plus date).
+
+### Changed (continued)
+- `IMMICH_BASE_URL` and `PUBLIC_BASE_URL` are required: the app refuses to start (exit code 1, the missing setting is named in the log) if one is missing or not an http(s) URL. `IMMICH_BASE_URL` no longer defaults to localhost, and `/api` is added to it when missing.
+- `DATA_DIR` (default `/data`) replaces `STATE_DB` and `CHUNK_DIR`; state, chunks and cookies all live in it. Set it only for runs outside Docker.
+- The container no longer starts Uvicorn with auto-reload; set `RELOAD=true` for development. A missing `SESSION_SECRET` is logged as a warning.
+- The password screen of a link shows the link name and marks a wrong password on the field instead of showing a banner; no toast on success.
+
+### Removed
+- Support for Immich's native shared links at `/invite/<key>`: Immich's own share page covers that, and these links had no limits or logs here.
+- Anonymous public uploader and `PUBLIC_UPLOAD_PAGE_ENABLED`. Use an unlimited link instead.
+- (Re-added as optional, see above:) iOS Shortcut docs and `/api/upload/base64`, `/api/upload/file`,
+  `/api/upload/batch`, `/api/upload/urls`.
+- The "Test connection" button; the connection is checked on the login page.
+
 ## [1.9.1] - 2026-08-25
 
 ### Fixed

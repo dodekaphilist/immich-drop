@@ -41,3 +41,9 @@ state.db
 # Claude AI config
 CLAUDE.md
 docs/superpowers/
+
+# Svelte login app
+web/node_modules/
+web/build/
+web/.svelte-kit/
+frontend/app/

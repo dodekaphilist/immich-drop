@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Login - Immich Drop</title>
+    <link rel="icon" type="image/png" href="/static/favicon.png" />
+    <link rel="icon" type="image/svg+xml" href="/static/immich-drop-light.svg" media="(prefers-color-scheme: light)" />
+    <link rel="icon" type="image/svg+xml" href="/static/immich-drop-dark.svg" media="(prefers-color-scheme: dark)" />
+    <script>
+      // Apply the stored or system theme before first paint (the UI library only syncs on toggle).
+      (function () {
+        try {
+          var pref = 'system';
+          try {
+            var raw = localStorage.getItem('immich-ui-theme');
+            var v = raw && JSON.parse(raw);
+            if (v === 'light' || v === 'dark') pref = v;
+          } catch (e) {}
+          var dark = pref === 'dark' || (pref === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.classList.add(dark ? 'dark' : 'light');
+          document.documentElement.classList.remove(dark ? 'light' : 'dark');
+        } catch (e) {}
+      })();
+    </script>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="off">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>
