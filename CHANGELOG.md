@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-09
+
+### Added
+- A connection indicator (green, red, or grey while checking) now also shows on the start page and on upload links, not only on the login page. It checks Immich every 15 seconds.
+- While Immich is not reachable, "Download" is disabled with a tooltip, and the album menu says that albums cannot be loaded; both recover on their own.
+
+### Changed
+- German progress texts say "wird geladen" instead of "lädt", and the ellipsis follows the word without a space.
+- Pydantic updated to 2.14.0 (pydantic-core 2.50.0).
+
 ## [2.0.0] - 2026-10-08
 
 ### Added
