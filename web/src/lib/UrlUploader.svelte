@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { Badge, Button, Card, CardBody, CardHeader, CardTitle, Icon, Text, Textarea, Tooltip } from '@immich/ui';
   import { mdiCookieOutline, mdiInformationOutline } from '@mdi/js';
-  import { fetchJson, jsonRequest } from './config.svelte.js';
+  import { config, connection, fetchJson, jsonRequest } from './config.svelte.js';
   import { t } from './i18n.svelte.js';
   import { u } from './paths.js';
   import AlbumPicker from './AlbumPicker.svelte';
@@ -13,6 +13,19 @@
   let jobs = $state([]); // { id, url, state, msgKey, msgParams, raw, filename, platform }
   let cookiesOpen = $state(false);
   let album = $state({ id: '', name: '' });
+  let hint = $state(false);
+  let hintTimer;
+
+  // Wait for a confirmed connection: a download can only fail while Immich is unreachable (or not yet known to be reachable).
+  // Without the connection check there is nothing to wait for.
+  const blocked = $derived(config.test_connection_enabled && connection.status !== 'ok');
+  const blockedText = $derived(connection.status === 'down' ? t('status.unreachable') : t('status.checking'));
+
+  function showHint() {
+    hint = true;
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => (hint = false), 3000); // touch has no hover-out to close it
+  }
 
   const splitUrls = (s) => s.split(/[\n\s]+/).map((u) => u.trim()).filter(Boolean);
   const urlCount = $derived(splitUrls(input).length);
@@ -131,9 +144,19 @@
       <AlbumPicker bind:value={album} />
 
       <div>
-        <Button disabled={!urlCount} onclick={submit}>
-          {urlCount > 1 ? t('url.submitN', { n: urlCount }) : t('url.submit')}
-        </Button>
+        <div class="relative inline-block">
+          <Button disabled={!urlCount || blocked} onclick={submit}>
+            {urlCount > 1 ? t('url.submitN', { n: urlCount }) : t('url.submit')}
+          </Button>
+          {#if blocked}
+            <!-- a disabled button gets no hover or tap, so a transparent cover takes them; a tap also opens the tooltip on touch screens -->
+            <Tooltip text={blockedText} delayDuration={0} bind:open={hint}>
+              {#snippet child({ props })}
+                <div {...props} class="absolute inset-0 cursor-not-allowed" onclick={showHint} role="presentation"></div>
+              {/snippet}
+            </Tooltip>
+          {/if}
+        </div>
       </div>
 
       {#each jobs as job (job.id)}

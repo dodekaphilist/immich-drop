@@ -21,7 +21,9 @@
 
   const ready = $derived(config.loaded && albumStore.loaded);
   const options = $derived(
-    albumStore.loaded
+    albumStore.loaded && !albumStore.ok
+      ? [{ label: t('album.unavailable'), value: NONE }]
+      : albumStore.loaded
       ? [{ label: t('album.none'), value: NONE }, ...albumStore.items.map((a) => ({ label: a.name, value: a.id }))]
       : [{ label: t('album.loading'), value: NONE }],
   );
