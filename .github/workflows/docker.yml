@@ -24,7 +24,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tag v2.0.0 -> ghcr.io/<owner>/immich-drop:2.0.0, :2.0 and :latest
+      # Tag v2.0.1 -> ghcr.io/<owner>/immich-drop:2.0.1, :2.0 and :latest
       - id: meta
         uses: docker/metadata-action@v5
         with:
