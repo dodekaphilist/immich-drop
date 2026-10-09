@@ -46,8 +46,10 @@ export function loadAlbums() {
   if (albumStore.loaded && Date.now() - albumsAt < ALBUM_MAX_AGE_MS) return Promise.resolve();
   albumsInflight ??= (async () => {
     try {
-      const { body } = await fetchJson('/api/albums');
+      const { status, body } = await fetchJson('/api/albums');
+      if (status === 502) connection.status = 'down';
       if (Array.isArray(body)) {
+        connection.status = 'ok';
         const items = body.map((a) => ({ id: a.id, name: a.albumName || a.title || a.id }));
         if (JSON.stringify(items) !== JSON.stringify(albumStore.items)) albumStore.items = items;
         albumStore.ok = true;
@@ -58,6 +60,41 @@ export function loadAlbums() {
     albumsInflight = null;
   })();
   return albumsInflight;
+}
+
+// Reachability of the Immich server: 'unknown' until the first answer, then 'ok' or 'down'.
+// Fed by the /api/ping poll and by the album list, whichever answers first.
+export const connection = $state({ status: 'unknown', host: '' });
+
+const CONNECTION_INTERVAL_MS = 15_000;
+
+async function checkConnection() {
+  try {
+    const ping = await (await fetch(u('/api/ping'), { method: 'POST' })).json();
+    connection.status = ping.ok ? 'ok' : 'down';
+    connection.host = ping.base_url ? new URL(ping.base_url).host : '';
+  } catch {
+    connection.status = 'down';
+  }
+  if (connection.status === 'ok' && albumStore.loaded && !albumStore.ok) loadAlbums(); // the server is back: retry the albums
+}
+
+/** Checks the connection now and then every 15 s while the tab is visible; returns a function that stops it. */
+export function watchConnection() {
+  let timer;
+  const tick = () => {
+    if (!document.hidden) checkConnection();
+  };
+  loadConfig().then(() => {
+    if (!config.test_connection_enabled) return;
+    tick();
+    timer = setInterval(tick, CONNECTION_INTERVAL_MS);
+  });
+  document.addEventListener('visibilitychange', tick);
+  return () => {
+    clearInterval(timer);
+    document.removeEventListener('visibilitychange', tick);
+  };
 }
 
 export async function fetchJson(url, options) {

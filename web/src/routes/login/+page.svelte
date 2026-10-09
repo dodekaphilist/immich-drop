@@ -1,9 +1,10 @@
 <script>
   import { onMount } from 'svelte';
-  import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Field, Input, PasswordInput, Stack, Tooltip } from '@immich/ui';
+  import { Alert, Button, Card, CardBody, CardHeader, CardTitle, Field, Input, PasswordInput, Stack } from '@immich/ui';
   import { t } from '$lib/i18n.svelte.js';
   import { u } from '$lib/paths.js';
   import AppLogo from '$lib/AppLogo.svelte';
+  import ConnectionIndicator from '$lib/ConnectionIndicator.svelte';
   import SettingsButton from '$lib/SettingsButton.svelte';
 
   let email = $state('');
@@ -14,17 +15,6 @@
   let oauth = $state(false);
   let ssoText = $state('');
   let message = $state('');
-  let connection = $state(null); // { ok, host } once checked
-
-  const statusText = $derived(
-    !connection
-      ? ''
-      : connection.ok
-        ? connection.host
-          ? t('status.connectedAt', { host: connection.host })
-          : t('status.connected')
-        : t('status.unreachable'),
-  );
 
   onMount(async () => {
     const params = new URLSearchParams(location.search);
@@ -47,16 +37,6 @@
     ssoText = o.oauthButtonText || '';
     message = o.message || '';
     if (!o.password && !o.oauth) errorKey = 'login.noMethod';
-    try {
-      const cfg = await (await fetch(u('/api/config'))).json();
-      if (cfg.test_connection_enabled) {
-        // Only the login page needs this: once logged in, the connection obviously works.
-        const ping = await (await fetch(u('/api/ping'), { method: 'POST' })).json();
-        connection = { ok: !!ping.ok, host: ping.base_url ? new URL(ping.base_url).host : '' };
-      }
-    } catch {
-      connection = { ok: false, host: '' };
-    }
   });
 
   async function submit(event) {
@@ -90,18 +70,7 @@
     <div class="mb-6 flex items-center justify-between">
       <AppLogo class="h-12" />
       <div class="flex items-center gap-2">
-        {#if connection}
-          <Tooltip text={statusText}>
-            {#snippet child({ props })}
-              <span
-                {...props}
-                role="img"
-                aria-label={statusText}
-                class="inline-block size-3 rounded-full {connection.ok ? 'bg-success-500' : 'bg-danger-500'}"
-              ></span>
-            {/snippet}
-          </Tooltip>
-        {/if}
+        <ConnectionIndicator />
         <SettingsButton />
       </div>
     </div>

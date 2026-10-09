@@ -5,6 +5,7 @@
   import { t } from './i18n.svelte.js';
   import { u } from './paths.js';
   import AppLogo from './AppLogo.svelte';
+  import ConnectionIndicator from './ConnectionIndicator.svelte';
   import SettingsButton from './SettingsButton.svelte';
   import { refreshKey } from './apikey.svelte.js';
 
@@ -23,6 +24,7 @@
       <Text fontWeight="bold" class="text-2xl">Immich Drop</Text>
     </div>
     <div class="flex items-center gap-2">
+      <ConnectionIndicator />
       <SettingsButton {owner} />
       {#if owner}
         <IconButton href={u('/logout')} icon={mdiLogout} shape="round" variant="ghost" size="small" aria-label={t('nav.logout')} />

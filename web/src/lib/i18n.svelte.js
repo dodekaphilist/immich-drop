@@ -58,6 +58,7 @@ const en = {
   'status.connectedAt': 'Connected to Immich at {host}',
   'status.connected': 'Connected to Immich',
   'status.unreachable': 'Immich is not reachable',
+  'status.checking': 'Checking connection…',
 
   // home
   'home.save.title': 'Download from platforms',
@@ -71,6 +72,7 @@ const en = {
   'album.label': 'Album',
   'album.none': 'No album',
   'album.loading': 'Loading albums …',
+  'album.unavailable': 'Albums cannot be loaded',
   'album.new': 'New album',
   'album.newPlaceholder': 'Name of a new album',
 
@@ -284,6 +286,7 @@ const de = {
   'status.connectedAt': 'Mit Immich verbunden: {host}',
   'status.connected': 'Mit Immich verbunden',
   'status.unreachable': 'Immich ist nicht erreichbar',
+  'status.checking': 'Verbindung wird geprüft…',
 
   'home.save.title': 'Download von Plattformen',
   'home.save.desc': 'Der Server lädt die Medien herunter und legt sie in deiner Immich-Bibliothek ab.',
@@ -295,6 +298,7 @@ const de = {
   'album.label': 'Album',
   'album.none': 'Kein Album',
   'album.loading': 'Lade Alben …',
+  'album.unavailable': 'Alben können nicht geladen werden',
   'album.new': 'Neues Album',
   'album.newPlaceholder': 'Name eines neuen Albums',
 
