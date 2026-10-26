@@ -21,5 +21,5 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 urllib3==2.8.0
 uvicorn==0.54.0
-yt-dlp[default,curl-cffi]==2026.8.19
-gallery-dl==1.32.16
+yt-dlp[default,curl-cffi]==2026.10.21
+gallery-dl==1.32.17
