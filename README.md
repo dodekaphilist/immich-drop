@@ -71,6 +71,8 @@ volumes:
 docker compose up -d
 ```
 
+It's recommended to pin a specific version (such as `2.0`) instead of `latest` to prevent unintentional damage from breaking changes, and read the [release notes](https://github.com/dodekaphilist/immich-drop/releases) before updating.
+
 
 ### Configuration
 
@@ -162,12 +164,14 @@ Platforms may also block clients that request too much too fast, so downloads ar
 - **Backend:** FastAPI on Uvicorn. It forwards uploads to Immich (`/assets`), downloads media with gallery-dl and yt-dlp, serves the UI, and pushes upload progress to the browser over a WebSocket.
 - **Login:** the app signs you in through Immich (password, or OAuth with PKCE via Immich's OAuth endpoints) and keeps your Immich token in a signed session cookie. Guests need no login; their link token is the only credential.
 - **Persistence:** everything lives in `DATA_DIR`: one SQLite file (`state.db`) with links, the upload log, a cache of file hashes for duplicate detection (per Immich account), and the API keys and platform cookies of the users, plus cookie files and chunks as plain files.
-- **Upload flow:** the browser sends the file (or chunks), the server hashes it, checks the local cache and Immich's bulk-upload check, streams it to Immich, adds it to the album, and reports each phase back over the WebSocket. Cancelling aborts the stream to Immich.
-- **Known limit:** files are held in memory while they are processed, so very large files need that much RAM.
+- **Upload flow:** the browser sends the file (or chunks), the server hashes it, asks Immich's bulk-upload duplicate check, streams it to Immich in blocks, adds it to the album, and reports each phase back over the WebSocket. Cancelling aborts the stream to Immich.
+- **Memory:** files are never held in memory as a whole, only in the temporary files of the request. `MAX_UPLOAD_SIZE_MB` caps the size of a single upload.
 
 ## Development
 
 Requires Python 3.14 (as in the Docker image) and [Node.js](https://nodejs.org/) 22 or newer.
+
+### Run locally
 
 ```bash
 git clone https://github.com/dodekaphilist/immich-drop.git
@@ -183,7 +187,16 @@ cp .env.example .env                    # then edit it
 python main.py                          # http://localhost:8080 (RELOAD=true restarts on code changes)
 ```
 
-After UI changes rebuild and copy again. Project layout:
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+The tests run the real app on a temporary data folder. Immich, yt-dlp and gallery-dl are replaced by stubs, so there is no network access, and a local `.env` is never read.
+
+### Project layout
 
 ```
 app/        FastAPI app: app.py (routes, uploads), api_routes.py (platform downloads),
@@ -195,6 +208,14 @@ docs/       iOS Shortcut guide
 ```
 
 Translations live in `web/src/lib/i18n.svelte.js`: add a dictionary and an entry in `LANGUAGES` for a new language.
+
+### Build image
+
+```bash
+docker build -t immich-drop .
+# OR
+docker compose up --build -d  # with a `docker-compose.yml`
+```
 
 ## Security & Privacy
 
