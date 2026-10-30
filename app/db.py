@@ -7,6 +7,7 @@ once at startup via init_db() instead of ad hoc DDL in request handlers.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 
 logger = logging.getLogger("immich_drop.db")
@@ -84,10 +85,14 @@ def _migrate_cookies_owner(cur: sqlite3.Cursor) -> None:
 
 
 def init_db() -> None:
-    """Create all tables and run best-effort column migrations (idempotent)."""
+    """Create all tables and run best-effort column migrations (idempotent).
+
+    Everything runs in one transaction: a crash half-way through a table migration leaves the old schema untouched.
+    """
     conn = connect()
     try:
         cur = conn.cursor()
+        cur.execute("BEGIN")
         _migrate_uploads_owner(cur)
         cur.execute(
             """
@@ -155,6 +160,12 @@ def init_db() -> None:
         )
         conn.commit()
     except Exception as e:
+        conn.rollback()
         logger.exception("Failed to initialize state DB: %s", e)
     finally:
         conn.close()
+    # The file holds users' API keys and cookies: owner only
+    try:
+        os.chmod(_DB_PATH, 0o600)
+    except OSError:
+        pass
