@@ -17,7 +17,7 @@ import signal
 import socket
 from pathlib import Path
 from typing import Optional, List, TYPE_CHECKING
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, urljoin, parse_qs, unquote
 from dataclasses import dataclass
 import json
 
@@ -199,6 +199,28 @@ def _ensure_public_url(url: str) -> str:
     return url
 
 
+MAX_URL_LENGTH = 2048
+
+
+def prepare_url(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """Normalise and vet a user-supplied URL before it reaches any download tool.
+
+    Returns (url, None) or (None, error). The URL must be a plain http(s) address that does not point to a
+    private network. A leading "-" is refused outright: the tools would read it as an option, not a URL.
+    """
+    url = (raw or "").strip()
+    if not url or len(url) > MAX_URL_LENGTH:
+        return None, "Invalid URL"
+    if url.startswith("-") or any(c.isspace() or ord(c) < 32 for c in url):
+        return None, "Invalid URL"
+    if "://" not in url:
+        url = "https://" + url
+    err = _validate_url_target(url)
+    if err:
+        return None, f"URL blocked: {err}"
+    return url, None
+
+
 def identify_platform(url: str) -> Optional[str]:
     """Identify which platform a URL belongs to"""
     for platform, patterns in SUPPORTED_PATTERNS.items():
@@ -258,56 +280,43 @@ async def download_direct_image(
 
     headers = {"User-Agent": BROWSER_USER_AGENT}
 
-    async def _validate_redirect(response):
-        """Event hook: validate each redirect target against SSRF blocklist."""
-        if response.is_redirect:
-            location = response.headers.get("location", "")
-            if location:
-                redirect_err = _validate_url_target(location)
-                if redirect_err:
-                    logger.warning(
-                        "Redirect blocked (SSRF): %s -> %s -- %s",
-                        response.url, location, redirect_err,
-                    )
-                    raise httpx.TooManyRedirects(
-                        f"Redirect blocked: {redirect_err}",
-                        request=response.request,
-                    )
-
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=60.0,
-            event_hooks={"response": [_validate_redirect]},
-        ) as client:
-            # HEAD request to pre-check size (non-fatal: some CDNs reject HEAD)
-            try:
-                head_resp = await client.head(url, headers=headers)
-                if head_resp.status_code < 400:
-                    content_length = head_resp.headers.get("content-length")
-                    if content_length and int(content_length) > MAX_DIRECT_IMAGE_SIZE:
+        # Redirects are followed by hand so every hop is checked, and the body is streamed so the size limit
+        # applies while it arrives (not after it is all in memory).
+        async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
+            data = None
+            resp_headers = {}
+            for _hop in range(6):
+                hop_err = await asyncio.to_thread(_validate_url_target, url)
+                if hop_err:
+                    return DownloadResult(success=False, error=f"URL blocked: {hop_err}")
+                async with client.stream("GET", url, headers=headers) as resp:
+                    if resp.is_redirect:
+                        location = resp.headers.get("location", "")
+                        if not location:
+                            return DownloadResult(success=False, error="Redirect without a target")
+                        url = urljoin(url, location)
+                        continue
+                    resp.raise_for_status()
+                    declared = resp.headers.get("content-length")
+                    if declared and declared.isdigit() and int(declared) > MAX_DIRECT_IMAGE_SIZE:
                         return DownloadResult(
                             success=False,
-                            error=f"File too large ({int(content_length)} bytes, max {MAX_DIRECT_IMAGE_SIZE})",
+                            error=f"File too large ({int(declared)} bytes, max {MAX_DIRECT_IMAGE_SIZE})",
                         )
-                else:
-                    logger.debug(
-                        "HEAD request returned %d for %s, proceeding with GET",
-                        head_resp.status_code, url,
-                    )
-            except httpx.HTTPError as e:
-                logger.debug("HEAD request failed for %s: %s, proceeding with GET", url, e)
-
-            # Download the image
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-
-            data = resp.content
-            if len(data) > MAX_DIRECT_IMAGE_SIZE:
-                return DownloadResult(
-                    success=False,
-                    error=f"Downloaded file too large ({len(data)} bytes)",
-                )
+                    buf = bytearray()
+                    async for part in resp.aiter_bytes():
+                        buf.extend(part)
+                        if len(buf) > MAX_DIRECT_IMAGE_SIZE:
+                            return DownloadResult(
+                                success=False,
+                                error=f"File too large (more than {MAX_DIRECT_IMAGE_SIZE} bytes)",
+                            )
+                    data = bytes(buf)
+                    resp_headers = resp.headers
+                    break
+            if data is None:
+                return DownloadResult(success=False, error="Too many redirects")
 
             # Determine file type from magic bytes first, then fall back to URL/headers
             detected_ext, detected_mime = detect_file_type(data)
@@ -321,7 +330,7 @@ async def download_direct_image(
                 ext = os.path.splitext(parsed_path)[1].lower()
                 if not ext or ext not in DIRECT_IMAGE_EXTENSIONS:
                     # Fall back to Content-Type header
-                    ct = resp.headers.get("content-type", "").split(";")[0].strip()
+                    ct = resp_headers.get("content-type", "").split(";")[0].strip()
                     # Reverse lookup: MIME -> extension (prefer shorter ext for dupes like .jpg/.jpeg)
                     mime_to_ext = {}
                     for k, v in CONTENT_TYPE_MAP.items():
@@ -398,6 +407,23 @@ CONTENT_TYPE_MAP = {
 }
 
 
+def _gallery_timestamp(value) -> Optional[float]:
+    """Unix time from a gallery-dl "date" field (epoch number or "YYYY-MM-DD HH:MM:SS" in UTC); None if unusable."""
+    from datetime import datetime, timezone
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if value > 0 else None
+    if isinstance(value, str) and value.strip():
+        try:
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    return None
+
+
 async def extract_via_gallery_dl(
     url: str,
     output_dir: str,
@@ -429,7 +455,8 @@ async def extract_via_gallery_dl(
     if cookies_file and os.path.exists(cookies_file):
         cmd.extend(["--cookies", cookies_file])
 
-    cmd.append(url)
+    # "--" ends option parsing, so the URL can never be read as an option
+    cmd.extend(["--", url])
 
     logger.info("gallery-dl command: %s", " ".join(cmd))
 
@@ -494,6 +521,9 @@ async def extract_via_gallery_dl(
                                   "date", "description", "title", "author", "username")
                         if k in sidecar_data
                     })
+                    ts = _gallery_timestamp(sidecar_data.get("date"))
+                    if ts is not None:
+                        metadata["timestamp"] = ts
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Could not read gallery-dl sidecar %s: %s", sidecar, e)
 
@@ -590,7 +620,8 @@ async def download_from_url(
             "--impersonate", "chrome",
         ])
 
-    cmd.append(url)
+    # "--" ends option parsing, so the URL can never be read as an option
+    cmd.extend(["--", url])
 
     logger.info("yt-dlp command: %s", " ".join(cmd))
 
@@ -657,7 +688,13 @@ async def download_from_url(
             )
 
         # Find the downloaded file
-        downloaded_files = list(Path(output_dir).glob("*"))
+        # Largest regular file; sidecars, partial files and folders (left by an earlier tool) do not count
+        downloaded_files = sorted(
+            (p for p in Path(output_dir).iterdir()
+             if p.is_file() and p.suffix.lower() not in (".json", ".part", ".ytdl")),
+            key=lambda p: p.stat().st_size,
+            reverse=True,
+        )
         if not downloaded_files:
             logger.error("yt-dlp returned 0 but no file found in %s", output_dir)
             return DownloadResult(
@@ -684,18 +721,21 @@ async def download_from_url(
 
         # Generate a better filename using metadata if available
         if metadata:
-            uploader = metadata.get('uploader', metadata.get('channel', 'unknown'))
-            title = metadata.get('title', metadata.get('description', ''))[:50]
-            video_id = metadata.get('id', downloaded_files[0].stem)
+            # Fields can be present but null (typical for generic extractors), so fall back with "or"
+            uploader = str(metadata.get('uploader') or metadata.get('channel') or 'unknown')
+            title = str(metadata.get('title') or metadata.get('description') or '')[:50]
+            video_id = str(metadata.get('id') or downloaded_files[0].stem)
 
-            # Clean filename
+            # Clean filename; the id comes from the remote site, so it gets the same treatment
             safe_title = re.sub(r'[^\w\s-]', '', title).strip()[:30]
             safe_uploader = re.sub(r'[^\w\s-]', '', uploader).strip()[:20]
+            safe_id = re.sub(r'[^\w-]', '_', video_id)[:60] or 'media'
+            source = platform or 'media'
 
             if safe_title:
-                new_filename = f"{platform}_{safe_uploader}_{safe_title}_{video_id}{ext}"
+                new_filename = f"{source}_{safe_uploader}_{safe_title}_{safe_id}{ext}"
             else:
-                new_filename = f"{platform}_{safe_uploader}_{video_id}{ext}"
+                new_filename = f"{source}_{safe_uploader}_{safe_id}{ext}"
 
             # Rename file
             new_filepath = os.path.join(output_dir, new_filename)
@@ -769,6 +809,11 @@ async def download_from_url_multi(
     if output_dir is None:
         output_dir = tempfile.mkdtemp(prefix="immich_drop_")
 
+    # Every entry point is vetted here: scheme, option-looking input and private targets
+    url, url_error = await asyncio.to_thread(prepare_url, url)
+    if url_error:
+        return [DownloadResult(success=False, error=url_error)]
+
     # Resolve Reddit share links and media redirects to actual URLs
     try:
         parsed = urlparse(url)
@@ -803,7 +848,7 @@ async def download_from_url_multi(
                         if response.is_redirect:
                             location = response.headers.get("location", "")
                             if location:
-                                err = _validate_url_target(location)
+                                err = _validate_url_target(urljoin(str(response.url), location))
                                 if err:
                                     raise httpx.HTTPStatusError(
                                         f"Redirect blocked (SSRF): {err}",
@@ -836,6 +881,11 @@ async def download_from_url_multi(
     except Exception as e:
         logger.debug("Reddit URL resolution failed for %s: %s", url, e)
 
+    # The Reddit steps may have produced a different URL: vet it again
+    url, url_error = await asyncio.to_thread(prepare_url, url)
+    if url_error:
+        return [DownloadResult(success=False, error=url_error)]
+
     # 1. Direct image URLs bypass everything
     if is_direct_image_url(url):
         logger.info("Detected direct image URL: %s", url)
@@ -866,6 +916,7 @@ async def download_from_url_multi(
         logger.info(
             "gallery-dl returned no results for %s, falling back to yt-dlp", url,
         )
+        _empty_dir(output_dir)  # drop what gallery-dl left behind
 
     # 3. yt-dlp fallback for video platforms and gallery-dl failures
     result = await download_from_url(url, output_dir, cookies_file)
@@ -901,14 +952,19 @@ async def download_from_url_multi(
     return [result]
 
 
-def cleanup_download(result: DownloadResult):
-    """Clean up downloaded file and its directory"""
-    if result.filepath and os.path.exists(result.filepath):
-        parent_dir = os.path.dirname(result.filepath)
-        os.remove(result.filepath)
-        # Remove parent directory if empty and in temp
-        if parent_dir.startswith(tempfile.gettempdir()):
+def _empty_dir(path: str) -> None:
+    """Remove everything inside a directory, keeping the directory."""
+    for child in Path(path).iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
             try:
-                os.rmdir(parent_dir)
+                child.unlink()
             except OSError:
-                pass  # Directory not empty or other error
+                pass
+
+
+def cleanup_workdir(path: Optional[str]) -> None:
+    """Remove a job's whole working directory (downloads, sidecars, partial files), also after a failure."""
+    if path:
+        shutil.rmtree(path, ignore_errors=True)

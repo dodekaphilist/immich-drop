@@ -103,6 +103,10 @@
   <input bind:this={fileInput} type="file" multiple accept="image/*,video/*" class="sr-only" onchange={onChange} onclick={(e) => e.stopPropagation()} {disabled} />
 </div>
 
+{#if manager.rejected}
+  <Text size="small" color="muted">{manager.rejected === 1 ? t('drop.rejectedOne') : t('drop.rejectedOther', { n: manager.rejected })}</Text>
+{/if}
+
 <Card>
   <CardBody>
     <div class="flex flex-wrap items-center justify-between gap-3">

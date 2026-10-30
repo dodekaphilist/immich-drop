@@ -7,7 +7,7 @@
   import { mdiDelete, mdiPencil } from '@mdi/js';
   import { fetchJson, jsonRequest } from './config.svelte.js';
   import { u } from './paths.js';
-  import { locale, t } from './i18n.svelte.js';
+  import { errorText, locale, t } from './i18n.svelte.js';
   import Dialog from './Dialog.svelte';
 
   /** @type {{ onClose: () => void }} */
@@ -34,12 +34,14 @@
 
   async function load() {
     try {
-      const { body } = await fetchJson('/api/cookies');
+      const { ok, body } = await fetchJson('/api/cookies');
+      if (!ok) throw new Error();
       cookies = (body && body.items) || [];
       platforms = (body && body.platforms) || [];
     } catch {
       cookies = [];
       platforms = [];
+      say('danger', t('cookies.loadFailed'));
     }
   }
 
@@ -51,7 +53,7 @@
     saving = true;
     try {
       const { ok, body } = await jsonRequest('/api/cookies', { platform, cookie_string: cookieString.trim() });
-      if (!ok) return say('danger', body.error || t('cookies.saveFailed'));
+      if (!ok) return say('danger', errorText(body.error, t('cookies.saveFailed')));
       say('success', t('cookies.saved', { platform }));
       platform = undefined;
       cookieString = '';
@@ -81,9 +83,10 @@
     }
   }
 
+  // The saved value never comes back from the server: editing means pasting the new cookies
   function edit(c) {
     platform = c.platform;
-    cookieString = c.cookie_string;
+    cookieString = '';
   }
 </script>
 
@@ -114,7 +117,7 @@
           {#each cookies as c (c.platform)}
             <TableRow>
               <TableCell class="font-medium">{cap(c.platform)}</TableCell>
-              <TableCell class="font-mono text-xs">{c.cookie_preview || (c.cookie_string ? c.cookie_string.slice(0, 40) + '...' : '')}</TableCell>
+              <TableCell class="font-mono text-xs">{c.cookie_preview}</TableCell>
               <TableCell>{fmtDate(c.updated_at)}</TableCell>
               <TableCell>
                 <div class="flex items-center gap-1">

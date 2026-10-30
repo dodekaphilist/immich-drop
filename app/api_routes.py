@@ -3,7 +3,7 @@ API Routes for immich-drop extensions
 - URL download and upload to Immich
 - Optional batch/file/base64 upload for iOS Shortcuts (SHORTCUT_ENABLED)
 """
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 from pydantic import BaseModel
@@ -12,9 +12,13 @@ import asyncio
 import base64
 import hashlib
 import httpx
+import io
 import logging
 import mimetypes
 import os
+import re
+import tempfile
+import uuid
 
 logger = logging.getLogger("immich_drop.api_routes")
 
@@ -22,14 +26,15 @@ from . import immich_client
 from .url_downloader import (
     download_from_url_multi,
     download_multiple_urls,
-    cleanup_download,
+    cleanup_workdir,
     identify_platform,
     is_direct_image_url,
+    prepare_url,
     SUPPORTED_PATTERNS,
 )
 from . import db
 from .cookie_manager import get_cookie_file_for_platform
-from .job_manager import create_job, get_job, update_job
+from .job_manager import MAX_ACTIVE_JOBS_PER_USER, active_jobs, create_job, get_job, update_job
 from .utils import detect_file_type
 
 
@@ -102,8 +107,23 @@ class JobStatusResponse(BaseModel):
 # Helper Functions
 # ============================================================================
 
+def _created_at(metadata: Optional[dict]) -> Optional[datetime]:
+    """Creation time from a download's metadata timestamp; None if missing or out of range."""
+    timestamp = (metadata or {}).get("timestamp")
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+# Background tasks are only weakly referenced by the event loop: keep them until they finish
+_background_tasks: set = set()
+
+
 async def upload_to_immich(
-    file_content: bytes,
+    file,  # seekable binary file; read in blocks, never loaded whole
     filename: str,
     content_type: str,
     config,  # Config object from main app
@@ -112,13 +132,16 @@ async def upload_to_immich(
     api_key: Optional[str] = None,  # defaults to the server key
 ) -> UploadResult:
     """Upload a file to Immich server"""
-    sha1 = hashlib.sha1(file_content).hexdigest()
+    sha1 = await asyncio.to_thread(immich_client.sha1_file, file)
+    size = file.seek(0, os.SEEK_END)
+    file.seek(0)
     headers = {"x-api-key": api_key or config.immich_api_key}
     outcome = await immich_client.upload_asset(
         httpx_client,
         config.normalized_base_url,
         headers,
-        file_bytes=file_content,
+        file=file,
+        size=size,
         filename=filename,
         content_type=content_type,
         checksum=sha1,
@@ -146,11 +169,12 @@ async def add_asset_to_album(
     config,
     httpx_client: httpx.AsyncClient,  # Shared httpx client
     api_key: Optional[str] = None,  # defaults to the server key
+    owner_id: str = "",
 ) -> bool:
     """Add an asset to an album (creates album if needed)"""
     headers = {"x-api-key": api_key or config.immich_api_key}
     album_id = await immich_client.find_or_create_album(
-        httpx_client, config.normalized_base_url, headers, album_name
+        httpx_client, config.normalized_base_url, headers, album_name, owner_id=owner_id
     )
     if not album_id:
         return False
@@ -229,9 +253,14 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
         if not config.social_media_uploads:
             raise HTTPException(status_code=403, detail="Downloads from platforms are disabled")
         api_key, user_id = key_and_user(request)
-        url = url_request.url.strip()
-        if not url:
+        if not url_request.url.strip():
             raise HTTPException(status_code=400, detail="URL is required")
+        # Scheme, option-looking input and private targets are refused here, before a job exists
+        url, url_error = await asyncio.to_thread(prepare_url, url_request.url)
+        if url_error:
+            raise HTTPException(status_code=400, detail=url_error)
+        if active_jobs(user_id) >= MAX_ACTIVE_JOBS_PER_USER:
+            raise HTTPException(status_code=429, detail="Too many downloads at once")
 
         platform = identify_platform(url)
         direct_image = is_direct_image_url(url)
@@ -240,12 +269,68 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
             platform or "generic", direct_image, url,
         )
 
-        job = create_job(url, url_request.album_name)
+        job = create_job(url, url_request.album_name, user_id)
         httpx_client = request.app.state.httpx_client
 
-        asyncio.create_task(_process_url_job(job.id, url, url_request.album_name, platform, httpx_client, api_key, user_id))
+        task = asyncio.create_task(_process_url_job(job.id, url, url_request.album_name, platform, httpx_client, api_key, user_id))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
         return JobResponse(job_id=job.id, status=job.status)
+
+    def _check_size(size: int) -> None:
+        limit = config.max_upload_size_mb * 1024 * 1024
+        if limit and size > limit:
+            raise HTTPException(status_code=413, detail="file_too_large")
+
+    async def _store(
+        file,
+        filename: str,
+        content_type: str,
+        album_name: Optional[str],
+        httpx_client,
+        api_key: Optional[str],
+        user_id: str,
+        file_created_at: Optional[datetime] = None,
+        platform: Optional[str] = None,
+    ) -> UploadResult:
+        """Upload one file to Immich and add it to the requested (or default) album."""
+        upload_result = await upload_to_immich(
+            file=file,
+            filename=filename,
+            content_type=content_type,
+            config=config,
+            httpx_client=httpx_client,
+            file_created_at=file_created_at,
+            api_key=api_key,
+        )
+        if platform is not None:
+            upload_result.platform = platform
+        target_album = album_name if album_name is not None else getattr(config, 'album_name', None)
+        if target_album and upload_result.asset_id and upload_result.status == "success":
+            await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key, owner_id=user_id)
+        return upload_result
+
+    async def _store_downloads(
+        downloads,
+        album_name: Optional[str],
+        source_label: Optional[str],
+        httpx_client,
+        api_key: Optional[str],
+        user_id: str,
+    ) -> List[UploadResult]:
+        """Upload every successful download; a failure of one file does not stop the others."""
+        results = []
+        for dr in downloads:
+            label = source_label or (identify_platform((dr.metadata or {}).get("post_url", "")) or (dr.metadata or {}).get("source", "direct_image"))
+            try:
+                with open(dr.filepath, "rb") as f:
+                    logger.info("Uploading to Immich: filename=%s content_type=%s size=%d bytes", dr.filename, dr.content_type, os.fstat(f.fileno()).st_size)
+                    results.append(await _store(f, dr.filename, dr.content_type or "application/octet-stream", album_name, httpx_client, api_key, user_id, _created_at(dr.metadata), label))
+            except Exception as e:
+                logger.exception("Upload of %s failed: %s", dr.filename, e)
+                results.append(UploadResult(filename=dr.filename or "unknown", status="error", error=str(e), platform=label))
+        return results
 
     async def _process_url_job(
         job_id: str,
@@ -257,11 +342,13 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
         user_id: str = "",
     ):
         """Background task: download media from URL and upload to Immich."""
+        # One private folder per job; it is removed in the end, whatever happened (sidecars, partial files, ...)
+        work_dir = tempfile.mkdtemp(prefix="immich_drop_")
         try:
             update_job(job_id, status="downloading")
 
             cookies_file = get_cookie_file_for_platform(platform, config.state_db, user_id) if platform else None
-            download_results = await download_from_url_multi(url, cookies_file=cookies_file, settings=config)
+            download_results = await download_from_url_multi(url, work_dir, cookies_file=cookies_file, settings=config)
 
             successful_downloads = [r for r in download_results if r.success]
             if not successful_downloads:
@@ -271,80 +358,33 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
                 return
 
             update_job(job_id, status="uploading")
-
-            source_label = platform or "direct_image"
-            primary_upload_result = None
-            all_upload_results = []
-            total_uploaded = 0
-
-            try:
-                for download_result in successful_downloads:
-                    with open(download_result.filepath, "rb") as f:
-                        file_content = f.read()
-
-                    logger.info(
-                        "Uploading to Immich: filename=%s content_type=%s size=%d bytes",
-                        download_result.filename,
-                        download_result.content_type,
-                        len(file_content),
-                    )
-
-                    file_created_at = None
-                    if download_result.metadata:
-                        timestamp = download_result.metadata.get("timestamp")
-                        if timestamp:
-                            file_created_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
-                    upload_result = await upload_to_immich(
-                        file_content=file_content,
-                        filename=download_result.filename,
-                        content_type=download_result.content_type,
-                        config=config,
-                        httpx_client=httpx_client,
-                        file_created_at=file_created_at,
-                        api_key=api_key,
-                    )
-                    upload_result.platform = source_label
-
-                    target_album = album_name if album_name is not None else getattr(config, 'album_name', None)
-                    if target_album and upload_result.asset_id and upload_result.status == "success":
-                        await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
-
-                    if upload_result.status == "success":
-                        total_uploaded += 1
-
-                    all_upload_results.append(upload_result)
-
-                    if primary_upload_result is None:
-                        primary_upload_result = upload_result
-
-                if total_uploaded > 1:
-                    logger.info(
-                        "Gallery upload complete: %d/%d items uploaded for %s",
-                        total_uploaded, len(successful_downloads), url,
-                    )
-
-                response = UrlUploadResponse(
-                    success=primary_upload_result.status == "success",
-                    result=primary_upload_result,
-                    error=primary_upload_result.error,
-                    total_uploaded=total_uploaded,
-                    additional_results=all_upload_results[1:],
-                )
-                update_job(job_id, status="completed", result=response.model_dump())
-
-            finally:
-                for download_result in download_results:
-                    cleanup_download(download_result)
+            uploads = await _store_downloads(successful_downloads, album_name, platform or "direct_image", httpx_client, api_key, user_id)
+            uploaded = [r for r in uploads if r.status == "success"]
+            if not uploaded:
+                update_job(job_id, status="failed", error=uploads[0].error or "Upload failed")
+                return
+            if len(uploaded) > 1:
+                logger.info("Gallery upload complete: %d/%d items uploaded for %s", len(uploaded), len(successful_downloads), url)
+            primary = uploaded[0]
+            response = UrlUploadResponse(
+                success=True,
+                result=primary,
+                error=None,
+                total_uploaded=len(uploaded),
+                additional_results=[r for r in uploads if r is not primary],
+            )
+            update_job(job_id, status="completed", result=response.model_dump())
 
         except Exception as e:
             logger.exception("Job %s failed: %s", job_id, e)
             update_job(job_id, status="failed", error=str(e))
+        finally:
+            cleanup_workdir(work_dir)
 
     @router.get("/upload/url/status/{job_id}", response_model=JobStatusResponse)
-    async def get_upload_status(job_id: str):
-        """Poll for the status of an async URL upload job."""
-        job = get_job(job_id)
+    async def get_upload_status(job_id: str, request: Request):
+        """Poll for the status of an async URL upload job (only its creator can see it)."""
+        job = get_job(job_id, request.state.user_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found or expired")
         resp = {
@@ -361,7 +401,6 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
     @shortcut_router.post("/upload/urls", response_model=BatchUploadResponse)
     async def upload_from_urls(
         batch_request: UrlBatchUploadRequest,
-        background_tasks: BackgroundTasks,
         request: Request,
     ):
         """
@@ -381,8 +420,11 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
         if len(urls) > 10:
             raise HTTPException(status_code=400, detail="Maximum 10 URLs per request")
 
+        if active_jobs(user_id) >= MAX_ACTIVE_JOBS_PER_USER:
+            raise HTTPException(status_code=429, detail="Too many downloads at once")
+
         # Collect platforms for cookie selection; unknown URLs are allowed through
-        # and attempted by yt-dlp / gallery-dl.
+        # and attempted by yt-dlp / gallery-dl (after the same vetting as single URLs).
         platforms = [identify_platform(u) for u in urls]
 
         # Look up cookies - if all URLs are from the same platform, use cookies
@@ -392,53 +434,23 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
             cookies_file = get_cookie_file_for_platform(list(unique_platforms)[0], config.state_db, user_id)
 
         results = []
-        download_results = await download_multiple_urls(urls, cookies_file=cookies_file, settings=config)
+        batch_dir = tempfile.mkdtemp(prefix="immich_drop_batch_")
+        try:
+            download_results = await download_multiple_urls(urls, output_dir=batch_dir, cookies_file=cookies_file, settings=config)
 
-        for download_result in download_results:
-            # Derive platform from the result's metadata or original URL
-            post_url = (download_result.metadata or {}).get("post_url", "")
-            platform = identify_platform(post_url) if post_url else None
-            source_label = platform or (download_result.metadata or {}).get("source", "direct_image")
-
-            if not download_result.success:
-                results.append(UploadResult(
-                    filename=download_result.filename or post_url or "unknown",
-                    status="error",
-                    error=download_result.error,
-                    platform=source_label,
-                ))
-                continue
-
-            try:
-                with open(download_result.filepath, "rb") as f:
-                    file_content = f.read()
-
-                file_created_at = None
-                if download_result.metadata:
-                    timestamp = download_result.metadata.get("timestamp")
-                    if timestamp:
-                        file_created_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
-                upload_result = await upload_to_immich(
-                    file_content=file_content,
-                    filename=download_result.filename,
-                    content_type=download_result.content_type,
-                    config=config,
-                    httpx_client=httpx_client,
-                    file_created_at=file_created_at,
-                    api_key=api_key,
-                )
-                upload_result.platform = source_label
-
-                # Add to album
-                album_name = batch_request.album_name if batch_request.album_name is not None else getattr(config, 'album_name', None)
-                if album_name and upload_result.asset_id and upload_result.status == "success":
-                    await add_asset_to_album(upload_result.asset_id, album_name, config, httpx_client, api_key)
-
-                results.append(upload_result)
-
-            finally:
-                background_tasks.add_task(cleanup_download, download_result)
+            for download_result in download_results:
+                if not download_result.success:
+                    post_url = (download_result.metadata or {}).get("post_url", "")
+                    results.append(UploadResult(
+                        filename=download_result.filename or post_url or "unknown",
+                        status="error",
+                        error=download_result.error,
+                        platform=identify_platform(post_url) if post_url else (download_result.metadata or {}).get("source"),
+                    ))
+                    continue
+                results.extend(await _store_downloads([download_result], batch_request.album_name, None, httpx_client, api_key, user_id))
+        finally:
+            cleanup_workdir(batch_dir)
 
         successful = sum(1 for r in results if r.status == "success" and not r.duplicate)
         duplicates = sum(1 for r in results if r.duplicate)
@@ -451,6 +463,11 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
             failed=failed,
             results=results,
         )
+
+    def _upload_name(name: Optional[str]) -> str:
+        """File name from the client without control characters; a random one if there is none."""
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", "", name or "").strip()
+        return cleaned or f"upload_{uuid.uuid4().hex}"
 
     @shortcut_router.post("/upload/batch", response_model=BatchUploadResponse)
     async def upload_batch_files(
@@ -475,25 +492,11 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
         results = []
 
         for file in files:
-            contents = await file.read()
-            filename = file.filename or f"upload_{datetime.utcnow().timestamp()}"
-            content_type = file.content_type or "application/octet-stream"
-
-            upload_result = await upload_to_immich(
-                file_content=contents,
-                filename=filename,
-                content_type=content_type,
-                config=config,
-                httpx_client=httpx_client,
-                api_key=api_key,
-                )
-
-            # Add to album
-            target_album = album_name if album_name is not None else getattr(config, 'album_name', None)
-            if target_album and upload_result.asset_id and upload_result.status == "success":
-                await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
-
-            results.append(upload_result)
+            _check_size(file.size or 0)
+            results.append(await _store(
+                file.file, _upload_name(file.filename), file.content_type or "application/octet-stream",
+                album_name, httpx_client, api_key, user_id,
+            ))
 
         successful = sum(1 for r in results if r.status == "success" and not r.duplicate)
         duplicates = sum(1 for r in results if r.duplicate)
@@ -518,24 +521,11 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
         """
         api_key, user_id = key_and_user(request)
         httpx_client = request.app.state.httpx_client
-        contents = await file.read()
-        filename = file.filename or f"upload_{datetime.utcnow().timestamp()}"
-        content_type = file.content_type or "application/octet-stream"
-
-        upload_result = await upload_to_immich(
-            file_content=contents,
-            filename=filename,
-            content_type=content_type,
-            config=config,
-            httpx_client=httpx_client,
-            api_key=api_key,
+        _check_size(file.size or 0)
+        return await _store(
+            file.file, _upload_name(file.filename), file.content_type or "application/octet-stream",
+            album_name, httpx_client, api_key, user_id,
         )
-
-        target_album = album_name if album_name is not None else getattr(config, 'album_name', None)
-        if target_album and upload_result.asset_id and upload_result.status == "success":
-            await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
-
-        return upload_result
 
     @shortcut_router.post("/upload/base64", response_model=UploadResult)
     async def upload_base64_file(
@@ -566,12 +556,13 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
             file_content = base64.b64decode(data_str)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid base64 data: {str(e)}")
+        _check_size(len(file_content))
 
         # Detect file type from magic bytes
         detected_ext, detected_mime = detect_file_type(file_content)
 
         # Determine filename - use provided name or generate one
-        base_filename = upload_request.filename or f"upload_{datetime.utcnow().timestamp()}"
+        base_filename = _upload_name(upload_request.filename)
 
         # If filename lacks extension or has wrong extension, use detected type
         _, existing_ext = os.path.splitext(base_filename)
@@ -587,20 +578,7 @@ def create_api_routes(config, key_for_user=lambda user_id: None):
             content_type, _ = mimetypes.guess_type(filename)
             content_type = content_type or "application/octet-stream"
 
-        upload_result = await upload_to_immich(
-            file_content=file_content,
-            filename=filename,
-            content_type=content_type,
-            config=config,
-            httpx_client=httpx_client,
-            api_key=api_key,
-        )
-
-        target_album = upload_request.album_name if upload_request.album_name is not None else getattr(config, 'album_name', None)
-        if target_album and upload_result.asset_id and upload_result.status == "success":
-            await add_asset_to_album(upload_result.asset_id, target_album, config, httpx_client, api_key)
-
-        return upload_result
+        return await _store(io.BytesIO(file_content), filename, content_type, upload_request.album_name, httpx_client, api_key, user_id)
 
     if config.shortcut_enabled:
         router.include_router(shortcut_router)

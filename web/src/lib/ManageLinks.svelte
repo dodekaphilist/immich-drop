@@ -38,7 +38,8 @@
   const dayStr = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   const today = dayStr(new Date());
   const maxDate = dayStr(new Date(Date.now() + 3650 * 864e5));
-  const dateStr = (s) => (s ? new Date(s).toISOString().slice(0, 10) : '');
+  // Dates from the server are UTC timestamps; the picker works with the local calendar day
+  const dateStr = (s) => (s ? dayStr(new Date(s)) : '');
   const urlFor = (row) => `${location.origin}${u(`/invite/${row.token}`)}`;
   const isDisabled = (row) => /disabled/i.test(String(row.inactiveReason || ''));
 
@@ -47,11 +48,13 @@
     if (q.trim()) params.set('q', q.trim());
     if (sort) params.set('sort', sort);
     try {
-      const { body } = await fetchJson('/api/invites?' + params.toString());
+      const { ok, body } = await fetchJson('/api/invites?' + params.toString());
+      if (!ok) throw new Error();
       rows = (body && body.items) || [];
       error = '';
     } catch {
       rows = [];
+      error = t('links.loadFailed');
     }
     loaded = true;
   }
@@ -158,9 +161,9 @@
     // Only send the expiry when it was changed: an unchanged, already expired date would be rejected
     if (detail.exp !== dateStr(detail.row.expiresAt)) {
       if (detail.exp) {
-        const dt = new Date(detail.exp);
-        dt.setHours(23, 59, 59, 999);
-        payload.expiresAt = dt.toISOString().slice(0, 19);
+        // end of the chosen day in the user's own time zone, sent as a UTC instant
+        const [y, mo, d] = detail.exp.split('-').map(Number);
+        payload.expiresAt = new Date(y, mo - 1, d, 23, 59, 59).toISOString();
       } else {
         payload.expiresAt = null;
       }

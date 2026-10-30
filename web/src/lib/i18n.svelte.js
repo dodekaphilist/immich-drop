@@ -169,7 +169,6 @@ const en = {
   'links.protected': 'Password protected',
   'links.empty': 'No links available',
   'links.loading': 'Loading...',
-  'links.details': 'Details',
   'links.more': 'More actions',
   'links.copy': 'Copy link',
   'links.qr': 'QR code',
@@ -214,7 +213,25 @@ const en = {
   'queue.processing': 'Processing...',
   'upload.failed': 'Upload failed',
   'upload.network': 'Network error',
-  'upload.noKey': 'Uploads are currently not possible',
+  'err.no_api_key': 'Uploads are currently not possible',
+  'err.invite_expired': 'This link has expired.',
+  'err.invite_disabled': 'This link has been disabled.',
+  'err.invite_claimed': 'This link has already been used.',
+  'err.invite_exhausted': 'This link has no uploads left.',
+  'err.invalid_invite': 'This link is not valid.',
+  'err.invite_password_required': 'This link needs its password first.',
+  'err.login_required': 'Please sign in again.',
+  'err.file_too_large': 'The file is too large.',
+  'err.chunked_uploads_disabled': 'Large uploads are not enabled on this server.',
+  'err.too_many_attempts': 'Too many attempts. Please try again later.',
+  'err.invalid_cookie_string': 'The cookie string is too long or contains invalid characters.',
+  'err.unsupported_platform': 'This platform is not supported.',
+  'drop.rejectedOne': '1 file was skipped (only photos and videos are supported).',
+  'drop.rejectedOther': '{n} files were skipped (only photos and videos are supported).',
+  'login.tooMany': 'Too many attempts. Please try again later.',
+  'links.loadFailed': 'Could not load the links',
+  'cookies.loadFailed': 'Could not load the cookies',
+  'url.msg.tooMany': 'Too many downloads at once. Please wait for one to finish.',
 
   // invite page
   'invite.default': 'Upload photos and videos',
@@ -391,7 +408,6 @@ const de = {
   'links.protected': 'Passwortgeschützt',
   'links.empty': 'Keine Links vorhanden',
   'links.loading': 'Wird geladen…',
-  'links.details': 'Details',
   'links.more': 'Weitere Aktionen',
   'links.copy': 'Link kopieren',
   'links.qr': 'QR-Code',
@@ -435,7 +451,25 @@ const de = {
   'queue.processing': 'Verarbeite...',
   'upload.failed': 'Upload fehlgeschlagen',
   'upload.network': 'Netzwerkfehler',
-  'upload.noKey': 'Uploads sind derzeit nicht möglich',
+  'err.no_api_key': 'Uploads sind derzeit nicht möglich',
+  'err.invite_expired': 'Dieser Link ist abgelaufen.',
+  'err.invite_disabled': 'Dieser Link wurde deaktiviert.',
+  'err.invite_claimed': 'Dieser Link wurde bereits verwendet.',
+  'err.invite_exhausted': 'Mit diesem Link sind keine Uploads mehr übrig.',
+  'err.invalid_invite': 'Dieser Link ist ungültig.',
+  'err.invite_password_required': 'Für diesen Link wird zuerst das Passwort benötigt.',
+  'err.login_required': 'Bitte erneut anmelden.',
+  'err.file_too_large': 'Die Datei ist zu groß.',
+  'err.chunked_uploads_disabled': 'Große Uploads sind auf diesem Server nicht aktiviert.',
+  'err.too_many_attempts': 'Zu viele Versuche. Bitte später erneut versuchen.',
+  'err.invalid_cookie_string': 'Die Cookie-Zeichenfolge ist zu lang oder enthält ungültige Zeichen.',
+  'err.unsupported_platform': 'Diese Plattform wird nicht unterstützt.',
+  'drop.rejectedOne': '1 Datei wurde übersprungen (nur Fotos und Videos werden unterstützt).',
+  'drop.rejectedOther': '{n} Dateien wurden übersprungen (nur Fotos und Videos werden unterstützt).',
+  'login.tooMany': 'Zu viele Versuche. Bitte später erneut versuchen.',
+  'links.loadFailed': 'Links konnten nicht geladen werden',
+  'cookies.loadFailed': 'Cookies konnten nicht geladen werden',
+  'url.msg.tooMany': 'Zu viele Downloads gleichzeitig. Bitte warten, bis einer fertig ist.',
 
   'invite.default': 'Fotos und Videos hochladen',
   'invite.once': 'Einmal-Link',
@@ -513,6 +547,14 @@ export const i18n = new I18n();
 export function t(key, params = {}) {
   const text = dictionaries[i18n.lang][key] ?? en[key] ?? key;
   return text.replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? ''));
+}
+
+/** Translated text for a server error code (`err.<code>`); without one, the fallback (default: the code itself). */
+export function errorText(code, fallback) {
+  if (!code) return fallback ?? '';
+  const key = `err.${code}`;
+  const text = t(key);
+  return text === key ? (fallback ?? String(code)) : text;
 }
 
 /** Locale for date formatting. */

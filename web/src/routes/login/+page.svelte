@@ -51,7 +51,7 @@
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
-        errorKey = j.error === 'unauthorized' ? 'login.badCredentials' : 'login.failed';
+        errorKey = j.error === 'unauthorized' ? 'login.badCredentials' : j.error === 'too_many_attempts' ? 'login.tooMany' : 'login.failed';
         return;
       }
       location.href = u('/');

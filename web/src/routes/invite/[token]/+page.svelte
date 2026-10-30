@@ -50,9 +50,9 @@
     }
     unlocking = true;
     try {
-      const { ok, body } = await jsonRequest(`/api/invite/${token}/auth`, { password: pw });
+      const { ok, status, body } = await jsonRequest(`/api/invite/${token}/auth`, { password: pw });
       if (!ok || !body.authorized) {
-        pwError = t('invite.pwBad');
+        pwError = status === 429 ? t('login.tooMany') : t('invite.pwBad');
         return;
       }
       authorized = true;

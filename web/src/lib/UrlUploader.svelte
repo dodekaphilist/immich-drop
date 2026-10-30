@@ -39,7 +39,7 @@
     }
   });
 
-  async function pollJob(jobId, onState, intervalMs = 3000, maxAttempts = 100) {
+  async function pollJob(jobId, onState, intervalMs = 3000, maxAttempts = 1200) {
     for (let i = 0; i < maxAttempts; i++) {
       await new Promise((r) => setTimeout(r, intervalMs));
       try {
@@ -68,8 +68,9 @@
   async function run(job, albumName) {
     try {
       // An empty album name means "no album"; the server only falls back to its default when it is omitted.
-      const { body: data } = await jsonRequest('/api/upload/url', { url: job.url, album_name: albumName });
+      const { status, body: data } = await jsonRequest('/api/upload/url', { url: job.url, album_name: albumName });
       if (data.detail === 'no_api_key') return fail(job, 'url.msg.noKey');
+      if (status === 429) return fail(job, 'url.msg.tooMany');
       if (!data.job_id) return fail(job, 'url.msg.failed', data.detail || data.error || '');
       job.state = 'downloading';
       const result = await pollJob(data.job_id, (st) => {

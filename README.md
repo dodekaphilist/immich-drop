@@ -85,6 +85,7 @@ All settings are environment variables. `IMMICH_BASE_URL` and `PUBLIC_BASE_URL` 
 | `IMMICH_ALBUM_NAME` | — | Album that is preselected for new links and downloads |
 | `CHUNKED_UPLOADS_ENABLED` | `false` | Split large files into chunks (for proxies with request limits) |
 | `CHUNK_SIZE_MB` | `95` | Chunk size; only larger files are chunked |
+| `MAX_UPLOAD_SIZE_MB` | `0` | Largest file accepted per upload (0 = no limit); bigger files are refused before they are read |
 | `SOCIAL_MEDIA_UPLOADS_ENABLED` | `true` | Controls "Download from platforms" feature |
 | `DOWNLOAD_CONCURRENCY` | `1` | Simultaneous platform downloads |
 | `GALLERY_DL_SLEEP_REQUEST`, `GALLERY_DL_SLEEP`, `GALLERY_DL_TIMEOUT` | `10-25`, `5-15`, `300` | Pauses and timeout against rate limiting (seconds) |

@@ -11,18 +11,35 @@ sidecarData, visibility.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import BinaryIO, Callable, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger("immich_drop.immich_client")
 
 _UPLOAD_CHUNK = 1024 * 1024  # 1 MiB
+
+
+def sha1_file(f: BinaryIO) -> str:
+    """SHA-1 of a binary file, read in blocks (never the whole file at once); leaves the file at the start."""
+    f.seek(0)
+    h = hashlib.sha1()
+    for block in iter(lambda: f.read(_UPLOAD_CHUNK), b""):
+        h.update(block)
+    f.seek(0)
+    return h.hexdigest()
+
+
+def _header_safe(value: str) -> str:
+    """Drop control characters (CR/LF would let a file name add header lines to the multipart part)."""
+    return re.sub(r"[\x00-\x1f\x7f]", "", value)
 
 
 def to_immich_iso(dt: Optional[datetime]) -> str:
@@ -76,9 +93,10 @@ class UploadOutcome:
 
 def _multipart_parts(fields: Dict[str, str], filename: str, content_type: str, boundary: str) -> tuple[bytes, bytes]:
     """Build the multipart head (fields + file part header) and tail."""
+    filename = _header_safe(filename)
     safe = filename.replace("\\", "_").replace('"', "'")
     head = "".join(
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{_header_safe(v)}\r\n"
         for k, v in fields.items()
     )
     head += (
@@ -94,7 +112,8 @@ async def upload_asset(
     base_url: str,
     headers: Dict[str, str],
     *,
-    file_bytes: bytes,
+    file: BinaryIO,
+    size: int,
     filename: str,
     content_type: str,
     checksum: str,
@@ -104,7 +123,7 @@ async def upload_asset(
     should_cancel: Optional[Callable[[], bool]] = None,
     timeout: float = 300.0,
 ) -> UploadOutcome:
-    """POST /assets with a streaming multipart body and optional progress callback.
+    """POST /assets with a streaming multipart body (read from `file` in blocks) and optional progress callback.
 
     progress is called with 0-100 whenever the sent percentage changes. should_cancel is polled between
     chunks; once it returns True the request is aborted (Immich discards the incomplete upload).
@@ -117,25 +136,33 @@ async def upload_asset(
     }
     boundary = uuid.uuid4().hex
     head, tail = _multipart_parts(fields, filename, content_type or "application/octet-stream", boundary)
-    total = len(head) + len(file_bytes) + len(tail)
+    total = len(head) + size + len(tail)
+
+    async def blocks():
+        yield head
+        file.seek(0)
+        while True:
+            block = await asyncio.to_thread(file.read, _UPLOAD_CHUNK)
+            if not block:
+                break
+            yield block
+        yield tail
 
     async def body():
         sent = 0
         last_pct = -1
-        for blob in (head, file_bytes, tail):
-            for i in range(0, len(blob), _UPLOAD_CHUNK):
-                if should_cancel and should_cancel():
-                    raise RuntimeError("upload cancelled")
-                chunk = blob[i:i + _UPLOAD_CHUNK]
-                sent += len(chunk)
-                if progress:
-                    pct = int(sent * 100 / total)
-                    if pct != last_pct:
-                        last_pct = pct
-                        progress(pct)
-                yield chunk
-                # Let progress messages flush between chunks
-                await asyncio.sleep(0)
+        async for chunk in blocks():
+            if should_cancel and should_cancel():
+                raise RuntimeError("upload cancelled")
+            sent += len(chunk)
+            if progress:
+                pct = min(100, int(sent * 100 / total))
+                if pct != last_pct:
+                    last_pct = pct
+                    progress(pct)
+            yield chunk
+            # Let progress messages flush between chunks
+            await asyncio.sleep(0)
 
     req_headers = {
         **headers,
@@ -184,14 +211,20 @@ async def find_or_create_album(
     headers: Dict[str, str],
     album_name: str,
     description: Optional[str] = None,
+    owner_id: str = "",
 ) -> Optional[str]:
-    """Find an album by name or create it. Returns the album id or None."""
+    """Find an album by name or create it. Returns the album id or None.
+
+    The list also holds albums shared *with* the user, which they may not add to. With owner_id known, an album
+    of that owner wins over a same-named shared one.
+    """
     try:
         r = await client.get(f"{base_url}/albums", headers=headers, timeout=10.0)
         if r.status_code == 200:
-            for album in r.json():
-                if album.get("albumName") == album_name:
-                    return album.get("id")
+            matches = [a for a in r.json() if a.get("albumName") == album_name]
+            if matches:
+                own = [a for a in matches if owner_id and a.get("ownerId") == owner_id]
+                return (own or matches)[0].get("id")
         elif r.status_code >= 500:
             # Do not create albums while Immich is erroring; avoids duplicates
             logger.warning("Immich returned %s when listing albums, skipping album assignment", r.status_code)

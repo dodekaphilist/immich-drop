@@ -15,6 +15,13 @@
   onMount(() => {
     if (owner) refreshKey();
   });
+
+  async function logout() {
+    try {
+      await fetch(u('/api/logout'), { method: 'POST' });
+    } catch {}
+    location.href = u('/login');
+  }
 </script>
 
 <Container {size} center class="px-4 py-6">
@@ -27,7 +34,7 @@
       <ConnectionIndicator />
       <SettingsButton {owner} />
       {#if owner}
-        <IconButton href={u('/logout')} icon={mdiLogout} shape="round" variant="ghost" size="small" aria-label={t('nav.logout')} />
+        <IconButton onclick={logout} icon={mdiLogout} shape="round" variant="ghost" size="small" aria-label={t('nav.logout')} />
       {/if}
     </div>
   </header>

@@ -100,6 +100,8 @@ export function watchConnection() {
 export async function fetchJson(url, options) {
   const r = await fetch(u(url), options);
   const body = await r.json().catch(() => ({}));
+  // The session ended (or never existed): back to the login page, except where a 401 is expected
+  if (r.status === 401 && !/\/(invite\/|login)/.test(location.pathname)) location.href = u('/login');
   return { ok: r.ok, status: r.status, body };
 }
 

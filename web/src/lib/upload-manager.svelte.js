@@ -1,13 +1,11 @@
 import { config } from './config.svelte.js';
-import { t } from './i18n.svelte.js';
+import { errorText, t } from './i18n.svelte.js';
 import { u } from './paths.js';
 
 // Status precedence: never regress (e.g. uploading -> done must not go back to uploading).
 // 'sending' is the browser->server transfer; 'checking'/'uploading' arrive via WebSocket.
 const STATUS_ORDER = { queued: 0, sending: 1, checking: 2, uploading: 3, duplicate: 4, done: 4, cancelled: 5, error: 5 };
 const FINAL_STATES = new Set(['done', 'duplicate', 'cancelled', 'error']);
-// Server error codes that get a translated text
-const errorText = (code) => (code === 'no_api_key' ? t('upload.noKey') : code);
 const ACCEPT = /\.(jpe?g|png|heic|heif|webp|gif|tiff|bmp|mp4|mov|m4v|avi|mkv)$/i;
 
 // One progress bar over all phases. Every phase reports 0-100 on its own, which made the bar jump back
@@ -66,11 +64,12 @@ function computeFingerprint() {
 
 // POST a FormData via XHR so the browser->server transfer reports progress (fetch can't).
 // `onXhr` hands out the request so it can be aborted.
-function postForm(url, form, onProgress, onXhr) {
+function postForm(url, form, onProgress, onXhr, headers = {}) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     onXhr?.(xhr);
     xhr.open('POST', url);
+    for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
     xhr.responseType = 'json';
     if (xhr.upload && onProgress) {
       xhr.upload.onprogress = (e) => {
@@ -86,6 +85,7 @@ function postForm(url, form, onProgress, onXhr) {
 
 export class UploadManager {
   items = $state([]);
+  rejected = $state(0); // files of the last drop that were not photos or videos
   counts = $derived.by(() => {
     const c = { queued: 0, uploading: 0, done: 0, duplicate: 0, error: 0 };
     for (const it of this.items) {
@@ -100,6 +100,7 @@ export class UploadManager {
   #fingerprint = computeFingerprint();
   #socket = null;
   #closed = false;
+  #inflight = 0; // uploads running right now, over all runs of the queue
   #running = new Map(); // item id -> { xhr, controller } of the request currently carrying the file
 
   /** @param {{ inviteToken?: string|null }} opts */
@@ -147,7 +148,9 @@ export class UploadManager {
   }
 
   addFiles(files) {
-    const accepted = Array.from(files || []).filter((f) => /^(image|video)\//.test(f.type) || ACCEPT.test(f.name));
+    const all = Array.from(files || []);
+    const accepted = all.filter((f) => /^(image|video)\//.test(f.type) || ACCEPT.test(f.name));
+    this.rejected = all.length - accepted.length;
     for (const file of accepted) {
       this.items.unshift({ id: randomId(), file, name: file.name, size: file.size, status: 'queued', pct: 0, progress: 0, message: '', cancelling: false });
     }
@@ -156,8 +159,7 @@ export class UploadManager {
 
   clearFinished() {
     this.items = this.items.filter((i) => !['done', 'duplicate', 'cancelled'].includes(i.status));
-    // refresh the server's album cache so a renamed album triggers a new one
-    fetch(u('/api/album/reset'), { method: 'POST' }).catch(() => {});
+    this.#resetAlbumCache();
   }
 
   /** Take one entry off the list (a running upload is cancelled first). */
@@ -169,7 +171,12 @@ export class UploadManager {
   clearAll() {
     for (const it of this.items) if (!FINAL_STATES.has(it.status)) this.cancel(it.id);
     this.items = [];
-    fetch(u('/api/album/reset'), { method: 'POST' }).catch(() => {});
+    this.#resetAlbumCache();
+  }
+
+  /** Refresh the server's album cache so a renamed album triggers a new one (only logged-in pages have one). */
+  #resetAlbumCache() {
+    if (!this.inviteToken) fetch(u('/api/album/reset'), { method: 'POST' }).catch(() => {});
   }
 
   /**
@@ -192,39 +199,46 @@ export class UploadManager {
     }
     fetch(u('/api/upload/cancel'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...this.#authHeaders() },
       body: JSON.stringify({ session_id: this.#sessionId, item_id: id, invite_token: this.inviteToken || '' }),
     }).catch(() => {});
   }
 
   #runQueue() {
-    let inflight = 0;
-    const runNext = async () => {
-      if (inflight >= 3) return; // client-side throttle; server handles uploads regardless
+    // One counter for the whole manager: however many times files were added, at most 3 uploads run at once
+    while (this.#inflight < 3) {
       const next = this.items.find((i) => i.status === 'queued');
       if (!next) return;
-      this.#setPhase(next, 'sending', 0);
-      inflight++;
-      try {
-        if (config.chunked_uploads_enabled && next.file.size > config.chunk_size_mb * 1024 * 1024) {
-          await this.#uploadChunked(next);
-        } else {
-          await this.#uploadWhole(next);
-        }
-      } catch (err) {
-        if (next.cancelling || err?.name === 'AbortError') {
-          next.status = 'cancelled';
-        } else {
-          next.status = 'error';
-          next.message = errorText(String(err?.message || err));
-        }
-      } finally {
-        this.#running.delete(next.id);
-        inflight--;
-        setTimeout(runNext, 50);
+      this.#start(next);
+    }
+  }
+
+  async #start(next) {
+    this.#setPhase(next, 'sending', 0);
+    this.#inflight++;
+    try {
+      if (config.chunked_uploads_enabled && next.file.size > config.chunk_size_mb * 1024 * 1024) {
+        await this.#uploadChunked(next);
+      } else {
+        await this.#uploadWhole(next);
       }
-    };
-    for (let i = 0; i < 3; i++) runNext();
+    } catch (err) {
+      if (next.cancelling || err?.name === 'AbortError') {
+        next.status = 'cancelled';
+      } else {
+        next.status = 'error';
+        next.message = errorText(String(err?.message || err));
+      }
+    } finally {
+      this.#running.delete(next.id);
+      this.#inflight--;
+      setTimeout(() => this.#runQueue(), 50);
+    }
+  }
+
+  /** The invite token as a header, so the server can check it before it reads the file. */
+  #authHeaders() {
+    return this.inviteToken ? { 'X-Invite-Token': this.inviteToken } : {};
   }
 
   #finish(item, ok, body) {
@@ -259,14 +273,41 @@ export class UploadManager {
         if (item.status === 'sending') this.#setPhase(item, 'sending', pct);
       },
       (xhr) => this.#running.set(item.id, { xhr }),
+      this.#authHeaders(),
     );
     this.#finish(item, res.ok, res.body || {});
+  }
+
+  /** Send one part; a network error or a 5xx answer is retried twice, a refusal (4xx) is final. */
+  async #sendChunk(fd, item) {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (item.cancelling) throw new DOMException('cancelled', 'AbortError');
+      const controller = new AbortController();
+      this.#running.set(item.id, { controller });
+      let r;
+      try {
+        r = await fetch(u('/api/upload/chunk'), { method: 'POST', body: fd, headers: this.#authHeaders(), signal: controller.signal });
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e;
+        lastError = e;
+      }
+      if (r) {
+        if (r.ok) return;
+        const j = await r.json().catch(() => ({}));
+        const err = new Error(errorText(j.error, `Chunk failed (${r.status})`));
+        if (r.status < 500) throw err;
+        lastError = err;
+      }
+      await new Promise((res) => setTimeout(res, 1000 * (attempt + 1)));
+    }
+    throw lastError ?? new Error(t('upload.network'));
   }
 
   async #uploadChunked(item) {
     const chunkBytes = Math.max(1, config.chunk_size_mb | 0) * 1024 * 1024;
     const total = Math.ceil(item.file.size / chunkBytes) || 1;
-    const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json', ...this.#authHeaders() };
     const common = {
       item_id: item.id,
       session_id: this.#sessionId,
@@ -275,13 +316,15 @@ export class UploadManager {
       content_type: item.file.type || 'application/octet-stream',
       fingerprint: this.#fingerprint,
     };
-    try {
-      await fetch(u('/api/upload/chunk/init'), {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ ...common, name: item.file.name, size: item.file.size }),
-      });
-    } catch {}
+    const init = await fetch(u('/api/upload/chunk/init'), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...common, name: item.file.name, size: item.file.size }),
+    });
+    if (!init.ok) {
+      const j = await init.json().catch(() => ({}));
+      throw new Error(errorText(j.error, t('upload.failed')));
+    }
     for (let i = 0; i < total; i++) {
       if (item.cancelling) throw new DOMException('cancelled', 'AbortError');
       const start = i * chunkBytes;
@@ -294,13 +337,7 @@ export class UploadManager {
       if (this.inviteToken) fd.append('invite_token', this.inviteToken);
       fd.append('fingerprint', this.#fingerprint);
       fd.append('chunk', blob, `${item.file.name}.part${i}`);
-      const controller = new AbortController();
-      this.#running.set(item.id, { controller });
-      const r = await fetch(u('/api/upload/chunk'), { method: 'POST', body: fd, signal: controller.signal });
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}));
-        throw new Error(j.error || `Chunk ${i} failed`);
-      }
+      await this.#sendChunk(fd, item);
       this.#setPhase(item, 'sending', Math.round(((i + 1) / total) * 100));
     }
     if (item.cancelling) throw new DOMException('cancelled', 'AbortError');

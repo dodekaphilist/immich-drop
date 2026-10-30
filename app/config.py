@@ -5,6 +5,7 @@ Reads ONLY from .env; there is NO runtime mutation from the UI.
 
 from __future__ import annotations
 import ipaddress
+import logging
 import os
 from urllib.parse import urlparse
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ class Settings:
     log_level: str = "INFO"
     chunked_uploads_enabled: bool = False
     chunk_size_mb: int = 95
+    max_upload_size_mb: int = 0  # 0 = no limit
     gallery_dl_sleep_request: str = "10-25"
     gallery_dl_sleep: str = "5-15"
     gallery_dl_timeout: int = 300
@@ -113,20 +115,26 @@ def load_settings() -> Settings:
         session_secret = secrets.token_hex(32)
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     chunked_uploads_enabled = as_bool(os.getenv("CHUNKED_UPLOADS_ENABLED", "false"), False)
-    try:
-        chunk_size_mb = int(os.getenv("CHUNK_SIZE_MB", "95"))
-    except ValueError:
-        chunk_size_mb = 95
+    def as_int(name: str, default: int, minimum: int) -> int:
+        """Whole number from the environment; anything unusable (text, below minimum) falls back to the default."""
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            value = minimum - 1
+        if value < minimum:
+            logging.getLogger("immich_drop.config").warning("%s=%r is not a whole number >= %d, using %d", name, raw, minimum, default)
+            return default
+        return value
+
+    chunk_size_mb = as_int("CHUNK_SIZE_MB", 95, 1)
+    max_upload_size_mb = as_int("MAX_UPLOAD_SIZE_MB", 0, 0)
     gallery_dl_sleep_request = os.getenv("GALLERY_DL_SLEEP_REQUEST", "10-25")
     gallery_dl_sleep = os.getenv("GALLERY_DL_SLEEP", "5-15")
-    try:
-        gallery_dl_timeout = int(os.getenv("GALLERY_DL_TIMEOUT", "300"))
-    except ValueError:
-        gallery_dl_timeout = 300
-    try:
-        download_concurrency = int(os.getenv("DOWNLOAD_CONCURRENCY", "1"))
-    except ValueError:
-        download_concurrency = 1
+    gallery_dl_timeout = as_int("GALLERY_DL_TIMEOUT", 300, 1)
+    download_concurrency = as_int("DOWNLOAD_CONCURRENCY", 1, 1)
     instagram_ytdlp_fallback = as_bool(os.getenv("INSTAGRAM_YTDLP_FALLBACK", "false"), False)
     social_media_uploads = as_bool(os.getenv("SOCIAL_MEDIA_UPLOADS_ENABLED", "true"), True)
     test_connection_enabled = as_bool(os.getenv("TEST_CONNECTION_ENABLED", "true"), True)
@@ -144,6 +152,7 @@ def load_settings() -> Settings:
         log_level=log_level,
         chunked_uploads_enabled=chunked_uploads_enabled,
         chunk_size_mb=chunk_size_mb,
+        max_upload_size_mb=max_upload_size_mb,
         gallery_dl_sleep_request=gallery_dl_sleep_request,
         gallery_dl_sleep=gallery_dl_sleep,
         gallery_dl_timeout=gallery_dl_timeout,
