@@ -7,7 +7,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM python:3.14-alpine
+FROM python:3.15-alpine
 
 WORKDIR /immich_drop
 
